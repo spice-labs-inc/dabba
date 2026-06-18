@@ -1,11 +1,15 @@
 import { defineConfig } from "astro/config";
 import starlight from "@astrojs/starlight";
 
-// Base path: "/" for local dev preview; the CI gh-pages build sets DOCS_BASE=/dabba.
+// Base path + site come from the deploy environment so the build matches wherever
+// Pages actually serves it: root of a private *.pages.github.io URL, or
+// spice-labs-inc.github.io/dabba once the repo is public. CI passes DOCS_BASE /
+// DOCS_SITE from actions/configure-pages; both fall back to sensible local defaults.
 const base = process.env.DOCS_BASE || "/";
+const site = process.env.DOCS_SITE || "https://spice-labs-inc.github.io";
 
 export default defineConfig({
-  site: "https://spice-labs-inc.github.io",
+  site,
   base,
   integrations: [
     starlight({

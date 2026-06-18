@@ -25,6 +25,10 @@ jobs:
         working-directory: docs
     steps:
       - uses: actions/checkout@v4
+      # Detects the real serving path/URL (root for private *.pages.github.io,
+      # /dabba once public) so the asset base matches and styles don't 404.
+      - uses: actions/configure-pages@v5
+        id: pages
       - uses: pnpm/action-setup@v4
         with:
           version: 11
@@ -38,7 +42,8 @@ jobs:
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm exec astro build
         env:
-          DOCS_BASE: /dabba
+          DOCS_BASE: ${{ steps.pages.outputs.base_path }}
+          DOCS_SITE: ${{ steps.pages.outputs.origin }}
       - uses: actions/upload-pages-artifact@v3
         with:
           path: docs/dist
