@@ -1,0 +1,20 @@
+# Bring-your-own-cluster: point dabba at an existing kubeconfig instead of
+# provisioning. Works with any conformant cluster (k3s, k0s, RKE2, microk8s,
+# vcluster, a managed cloud you stood up yourself…). dabba skips provisioning and
+# installs + configures the platform on the cluster the kubeconfig points at.
+#   dabba up
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: DabbaConfig
+metadata:
+  name: dabba
+spec:
+  domain: localtest.me
+  tls:
+    issuer: selfsigned
+  defaultEnvironment: my-cluster
+  environments:
+    - name: my-cluster
+      substrate: existing
+      kubeconfig: ~/.kube/config # path to your cluster's kubeconfig (required for existing)
+  useCases:
+    - demo

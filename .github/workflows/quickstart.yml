@@ -1,0 +1,45 @@
+name: quickstart
+
+# Builds the dabba CLI and runs the tier-0 quickstart end to end on a kind cluster,
+# asserting the demo app serves the message that was seeded into OpenBao. This is
+# the regression test that keeps the quickstart from silently rotting.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_wrapper: false
+
+      - name: Build the dabba CLI
+        run: cargo build --release
+
+      - name: Bring up the platform
+        run: ./target/release/dabba up -c examples/local.yaml
+
+      - name: Assert the demo app serves the OpenBao-backed message
+        run: |
+          export KUBECONFIG="$PWD/.dabba/kind/kubeconfig"
+          kubectl -n podinfo port-forward svc/podinfo 9898:9898 &
+          pf=$!
+          sleep 5
+          body=$(curl -sf http://localhost:9898/ || true)
+          kill $pf || true
+          echo "$body"
+          echo "$body" | grep -q "delivered through dabba" \
+            || { echo "demo message not found in podinfo response"; exit 1; }
+
+      - name: Tear down
+        if: always()
+        run: ./target/release/dabba down -c examples/local.yaml

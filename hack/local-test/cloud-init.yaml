@@ -1,0 +1,19 @@
+#cloud-config
+package_update: true
+packages:
+  - git
+  - curl
+  - jq
+  - ca-certificates
+  - docker.io
+  - build-essential
+
+runcmd:
+  # inotify is host-wide and not namespaced, so raising it here covers the kind
+  # node containers (kube-proxy/controllers otherwise crash with "too many open
+  # files" on recent Kubernetes).
+  - echo "fs.inotify.max_user_watches = 1048576" >> /etc/sysctl.conf
+  - echo "fs.inotify.max_user_instances = 512" >> /etc/sysctl.conf
+  - sysctl -p
+  - systemctl enable --now docker
+  - usermod -aG docker ubuntu

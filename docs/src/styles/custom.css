@@ -1,0 +1,66 @@
+/* dabba docs theme — its own identity, the Spice Labs family look:
+   Epilogue type, green accent (#1FDB7D), deep-navy dark mode (#000015). */
+@import url("https://fonts.googleapis.com/css2?family=Epilogue:wght@400;500;600;700;800&display=swap");
+
+:root {
+  --sl-font: "Epilogue", system-ui, -apple-system, sans-serif;
+
+  /* Brand green accent */
+  --sl-color-accent-low: #06372a;
+  --sl-color-accent: #1fdb7d;
+  --sl-color-accent-high: #aef5d3;
+}
+
+/* Dark mode: deep navy backgrounds, green accents */
+:root[data-theme="dark"] {
+  --sl-color-bg: #000015;
+  --sl-color-bg-nav: #03042d;
+  --sl-color-bg-sidebar: #03042d;
+  --sl-color-bg-inline-code: #11132f;
+  --sl-color-hairline-shade: #1a1c3a;
+  --sl-color-text-accent: #1fdb7d;
+}
+
+/* Light mode accent text */
+:root[data-theme="light"] {
+  --sl-color-text-accent: #0f9d5c;
+}
+
+/* Hero wordmark + splash polish */
+.hero h1 {
+  font-weight: 800;
+  letter-spacing: -0.02em;
+}
+/* Starlight's .site-title lives in @layer starlight.core, so these unlayered rules
+   win regardless of specificity. Tighten the default ~1rem logo↔wordmark gap. */
+.site-title.sl-flex {
+  font-weight: 800;
+  letter-spacing: -0.01em;
+  gap: 0.35rem;
+  align-items: center;
+}
+/* The logo art has transparent padding inside its square; pull the wordmark back
+   across it so the spacing reads even. */
+.site-title.sl-flex img {
+  margin-inline-end: -0.15rem;
+}
+/* "dabba" is all-ascenders/no-descenders, so it optically rides high when centred;
+   nudge it down to sit on the logo's midline. */
+.site-title.sl-flex > span {
+  transform: translateY(0.1em);
+}
+
+/* Tables: break between words, never mid-word. Starlight defaults to
+   overflow-wrap: anywhere, which splits names like `kubeconfig` mid-character
+   when a wide neighbouring column squeezes the cell. Keep words whole and let a
+   too-wide table scroll instead (Starlight already wraps tables in a scroller). */
+.sl-markdown-content :is(th, td) {
+  overflow-wrap: normal;
+  word-break: normal;
+  hyphens: none;
+}
+/* The first column of a reference table is usually a short field/command name —
+   keep its inline code on one line. */
+.sl-markdown-content tr > :first-child code {
+  white-space: nowrap;
+}

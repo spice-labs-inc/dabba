@@ -1,0 +1,17 @@
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: DabbaConfig
+metadata:
+  name: dabba
+spec:
+  domain: localtest.me # shared across envs
+  tls:
+    issuer: selfsigned
+  defaultEnvironment: kind
+  environments:
+    - { name: kind, substrate: kind }
+    - { name: k3d, substrate: k3d }
+    - { name: minikube, substrate: minikube }
+  observability:
+    enabled: false # Vector -> OpenObserve (+ OTEL traces); opt-in, off by default
+  useCases:
+    - demo

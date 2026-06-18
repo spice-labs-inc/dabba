@@ -1,0 +1,81 @@
+---
+title: dabba
+description: A full Kubernetes platform from one config file — driven by the dabba CLI.
+---
+
+dabba brings up a full Kubernetes platform from a single config file — the same way on a laptop
+and on managed cloud. You drive it with the `dabba` CLI: bare verbs act on the config's default
+environment, and `dabba env <name> <verb>` targets a specific one. The config file is chosen
+with the global `-c/--config` flag (default `dabba.yaml`).
+
+New here? Start with the **[Quickstart](/quickstart/)** — clone to a working platform in a few
+minutes:
+
+```bash
+dabba up -c examples/local.yaml
+```
+
+## Lifecycle
+
+| Command | What it does |
+|---------|--------------|
+| `dabba init` | Write a starter config (kind / k3d / minikube environments). |
+| `dabba up` | Provision + bootstrap the default environment, then verify it reconciled. |
+| `dabba down` | Tear the default environment down. |
+| `dabba doctor` | Preflight: Docker, kubectl, OpenTofu on PATH. |
+
+## Read
+
+| Command | What it does |
+|---------|--------------|
+| `dabba status` | Verdict, declared-vs-live, component health, chart versions, endpoints. |
+| `dabba diagram` | The live topology as ASCII (`--mermaid` to emit a Mermaid graph). |
+| `dabba kubeconfig` | Print the environment's kubeconfig path (`--export` for an `export` line). |
+| `dabba ls` | List configured environments and which is the default. |
+
+## Environments
+
+`dabba env <name> <verb>` scopes any operation to one environment:
+
+```bash
+dabba env k3d up          # bring up the k3d environment
+dabba env staging status  # status of the staging environment
+dabba env kind diagram    # diagram for kind
+dabba env <name> add --substrate scaleway-kapsule   # add an env to the config
+dabba use <name>          # set the default environment
+```
+
+See [Configuration](/configuration/) for the config file these act on.
+
+## Secrets
+
+dabba ships no default credentials; everything is per-env random. Most secrets live in OpenBao
+and are addressed by their vault path. The OpenBao root token is the exception — the key to the
+vault, kept in a local per-env stash and fetched by keyword.
+
+```bash
+dabba secret ls                     # everything: the local/ stash and OpenBao
+dabba secret get dabba/forgejo      # a vault secret, by path (secret/dabba/forgejo)
+dabba secret get local/openbao-root # the root token, from the local stash (not OpenBao)
+```
+
+## Config
+
+```bash
+dabba config validate [file]   # validate a config against the schema
+dabba config show [file]       # print the parsed, validated config
+```
+
+## The stack
+
+| Layer | Component |
+|-------|-----------|
+| Provisioning | OpenTofu — kind / k3d / minikube (cloud substrates on the roadmap) |
+| GitOps | FluxCD via the [Flux Operator](https://github.com/controlplaneio-fluxcd/flux-operator), syncing from an in-cluster [Forgejo](https://forgejo.org/) |
+| Gateway | Envoy Gateway (Gateway API) |
+| TLS | cert-manager (self-signed CA locally; ACME in the cloud) |
+| Secrets | [External Secrets](https://external-secrets.io/) + [OpenBao](https://openbao.org/) |
+| Observability | Vector → OpenObserve + an OpenTelemetry collector (opt-in) |
+| Demo | [podinfo](https://github.com/stefanprodan/podinfo) — exercises the OpenBao → External Secrets → app chain end to end |
+
+See [Architecture](/architecture/) for how these fit together.
