@@ -3,11 +3,14 @@ name: quickstart
 # Builds the dabba CLI and runs the tier-0 quickstart end to end on a kind cluster,
 # asserting the demo app serves the message that was seeded into OpenBao. This is
 # the regression test that keeps the quickstart from silently rotting.
+# The quickstart e2e drives the PUBLIC path: tofu fetches the modules from
+# github.com/spice-labs-inc/dabba-modules and Forgejo is pulled from the ghcr mirror.
+# That needs the repos public and the mirror-forgejo package created, so it runs on a
+# schedule + on demand rather than on every push (where it would just fail).
 on:
-  push:
-    branches: [main]
-  pull_request:
   workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * *"
 
 jobs:
   e2e:
