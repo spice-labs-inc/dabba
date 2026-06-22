@@ -7,6 +7,7 @@
 //!   env:    ls | use <name> | env <name> [add|up|down|status|kubeconfig|diagram|rm]
 //!   read:   status | kubeconfig | diagram | secret
 //!   config: config validate | show
+//!   shell:  completions <shell>
 
 mod config;
 mod edit;
@@ -14,7 +15,8 @@ mod run;
 mod up;
 
 use anyhow::{Context, Result};
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
 use config::DabbaConfig;
 use std::path::{Path, PathBuf};
 
@@ -90,6 +92,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         action: ConfigAction,
+    },
+    /// Print a shell completion script (bash, zsh, fish, …) to stdout
+    Completions {
+        /// Target shell
+        shell: Shell,
     },
 }
 
@@ -180,6 +187,12 @@ fn main() -> Result<()> {
         Command::Use { name } => edit::use_env(&cfg, &name),
         Command::Init => edit::init(&cfg),
         Command::Env { name, action } => dispatch_env(&cfg, &name, action),
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut std::io::stdout());
+            Ok(())
+        }
     }
 }
 

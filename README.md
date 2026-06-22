@@ -17,13 +17,22 @@ Components are defaults you change in the config, not forks you maintain.
 ## Quickstart
 
 dabba drives Docker, [OpenTofu](https://opentofu.org/), and kubectl (`dabba doctor` checks
-they're on your PATH); building the CLI from source also needs a Rust toolchain. No cloud
-account, no secret manager, nothing to sign up for.
+they're on your PATH). No cloud account, no secret manager, nothing to sign up for.
+
+Install the CLI:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/spice-labs-inc/dabba/main/install.sh | bash
+```
+
+On Windows: `irm https://raw.githubusercontent.com/spice-labs-inc/dabba/main/install.ps1 | iex`.
+Or build from source with `cargo install --git https://github.com/spice-labs-inc/dabba`.
+
+Then bring up the local quickstart:
 
 ```bash
 git clone https://github.com/spice-labs-inc/dabba.git
 cd dabba
-cargo install --path .          # puts `dabba` on your PATH
 dabba up -c examples/local.yaml
 ```
 

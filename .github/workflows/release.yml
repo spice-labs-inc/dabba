@@ -1,0 +1,47 @@
+name: release
+
+# Builds the dabba binary for every supported platform and attaches it to the
+# GitHub Release for the pushed tag. install.sh / install.ps1 fetch these assets.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to build and upload to (must already exist)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: windows-latest
+            target: aarch64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      # Builds the binary for the target, archives it as dabba-<target>.tar.gz
+      # (.zip on Windows), and uploads it to the release for this tag.
+      - uses: taiki-e/upload-rust-binary-action@v1
+        with:
+          bin: dabba
+          target: ${{ matrix.target }}
+          archive: dabba-$target
+          ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}

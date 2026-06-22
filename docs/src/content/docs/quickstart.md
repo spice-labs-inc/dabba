@@ -9,8 +9,7 @@ cluster — no cloud account, no secret manager, nothing to sign up for.
 ## Requirements
 
 dabba drives **Docker**, **[OpenTofu](https://opentofu.org/)**, and **kubectl**, so they need to
-be on your PATH — `dabba doctor` checks for them. Building the CLI from source also needs a Rust
-toolchain (prebuilt binaries are on the way).
+be on your PATH — `dabba doctor` checks for them.
 
 :::note
 Local clusters and the platform components are demanding on inotify limits. If pods crash
@@ -21,12 +20,23 @@ sudo sysctl fs.inotify.max_user_instances=512 fs.inotify.max_user_watches=104857
 ```
 :::
 
-## Install and bring it up
+## Install the CLI
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/spice-labs-inc/dabba/main/install.sh | bash
+```
+
+On Windows, use `irm https://raw.githubusercontent.com/spice-labs-inc/dabba/main/install.ps1 | iex`.
+To build from source instead: `cargo install --git https://github.com/spice-labs-inc/dabba`.
+
+The installer also sets up shell completions. (`dabba completions <bash|zsh|fish|powershell>`
+prints a completion script if you'd rather wire it up yourself.)
+
+## Bring it up
 
 ```bash
 git clone https://github.com/spice-labs-inc/dabba.git
 cd dabba
-cargo install --path .          # puts `dabba` on your PATH
 dabba up -c examples/local.yaml
 ```
 
