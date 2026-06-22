@@ -98,7 +98,8 @@ pub fn run(opts: &Options) -> Result<()> {
     ));
     let c02arg = format!("-chdir={}", c02.display());
     run::run_quiet("tofu", &[&c02arg, "init", "-input=false"])?;
-    let vars = bootstrap_vars(&env, &kubeconfig, &openbao_root, &forgejo_pw);
+    set_tofu_secret_env(&openbao_root, &forgejo_pw);
+    let vars = bootstrap_vars(&env, &kubeconfig);
     let mut args = vec![c02arg.as_str(), "apply", "-auto-approve", "-input=false"];
     args.extend(vars.iter().map(String::as_str));
     run::run("tofu", &args)?;
@@ -164,7 +165,8 @@ pub fn down(opts: &DownOptions) -> Result<()> {
             let c02arg = format!("-chdir={}", c02.display());
             let openbao_root = read_stash(&workdir, "openbao-root");
             let forgejo_pw = read_stash(&workdir, "forgejo-password");
-            let vars = bootstrap_vars(&env, &kc, &openbao_root, &forgejo_pw);
+            set_tofu_secret_env(&openbao_root, &forgejo_pw);
+            let vars = bootstrap_vars(&env, &kc);
             let mut args = vec![c02arg.as_str(), "destroy", "-auto-approve", "-input=false"];
             args.extend(vars.iter().map(String::as_str));
             run::try_run("tofu", &args);
@@ -193,21 +195,35 @@ pub fn down(opts: &DownOptions) -> Result<()> {
 
 /// The -var args 02-bootstrap needs — shared by `up` (apply) and `down` (destroy).
 /// For one-cluster-per-env, `cluster` and `environment` are both the env name.
-fn bootstrap_vars(
-    env: &ResolvedEnv,
-    kubeconfig: &Path,
-    openbao_root: &str,
-    forgejo_pw: &str,
-) -> Vec<String> {
+fn bootstrap_vars(env: &ResolvedEnv, kubeconfig: &Path) -> Vec<String> {
     vec![
         format!("-var=kubeconfig_path={}", kubeconfig.display()),
         format!("-var=domain={}", env.domain),
         format!("-var=cluster_issuer={}", issuer_name(env.issuer)),
         format!("-var=cluster_name={}", env.name),
         format!("-var=environment={}", env.name),
-        format!("-var=openbao_root_token={openbao_root}"),
-        format!("-var=forgejo_admin_password={forgejo_pw}"),
     ]
+}
+
+/// Pass the secret tofu vars via `TF_VAR_*` env rather than `-var=` on the command
+/// line, which would expose them in the process argument list (`ps`, /proc/<pid>/cmdline).
+fn set_tofu_secret_env(openbao_root: &str, forgejo_pw: &str) {
+    std::env::set_var("TF_VAR_openbao_root_token", openbao_root);
+    std::env::set_var("TF_VAR_forgejo_admin_password", forgejo_pw);
+}
+
+/// Write a tiny `GIT_ASKPASS` helper that echoes `$DABBA_GIT_PW`, so the git password
+/// travels via env (same-user-readable) instead of the push URL (argv, world-readable).
+fn write_askpass() -> Result<PathBuf> {
+    let path = std::env::temp_dir().join(format!("dabba-askpass-{}.sh", std::process::id()));
+    std::fs::write(&path, "#!/bin/sh\nprintf '%s' \"$DABBA_GIT_PW\"\n")
+        .context("writing askpass")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(path)
 }
 
 /// Read-or-generate a per-env secret stashed in the workdir (0600). Reused across
@@ -541,18 +557,23 @@ fn secret_ctx(config: &Path, env_name: Option<&str>) -> Result<String> {
 }
 
 fn bao(token: &str, cmd: &str) -> Result<()> {
-    run::run(
+    // Read the token from stdin (not the argv, which `ps` / /proc exposes).
+    let script =
+        format!("read -r BAO_TOKEN; export BAO_TOKEN BAO_ADDR=http://127.0.0.1:8200; {cmd}");
+    run::run_stdin(
         "kubectl",
         &[
             "-n",
             "openbao",
             "exec",
+            "-i",
             "openbao-0",
             "--",
             "sh",
             "-c",
-            &format!("BAO_ADDR=http://127.0.0.1:8200 BAO_TOKEN={token} {cmd}"),
+            &script,
         ],
+        &format!("{token}\n"),
     )
 }
 
@@ -950,13 +971,13 @@ fn seed_forgejo_inner(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Re
         )
     })?;
 
-    let creds = format!("{FORGEJO_USER}:{forgejo_pw}");
-    run::try_run(
+    // Credentials via a curl config read from stdin (-K -), not -u in the argv.
+    let _ = run::run_stdin(
         "curl",
         &[
             "-sf",
-            "-u",
-            &creds,
+            "-K",
+            "-",
             "-X",
             "POST",
             "http://localhost:3000/api/v1/user/repos",
@@ -965,6 +986,7 @@ fn seed_forgejo_inner(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Re
             "-d",
             r#"{"name":"dabba-gitops","private":false,"auto_init":false}"#,
         ],
+        &format!("user = \"{FORGEJO_USER}:{forgejo_pw}\"\n"),
     );
 
     let src = std::env::temp_dir().join(format!("dabba-seed-{}", std::process::id()));
@@ -1004,15 +1026,23 @@ fn seed_forgejo_inner(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Re
             "seed gitops content",
         ],
     )?;
-    let push_url = format!(
-        "http://{FORGEJO_USER}:{forgejo_pw}@localhost:3000/{FORGEJO_USER}/dabba-gitops.git"
-    );
+    // Password via GIT_ASKPASS env (same-user-readable), not embedded in the push URL
+    // (which `ps` / /proc would expose). The URL carries only the username.
+    let askpass = write_askpass()?;
+    std::env::set_var("DABBA_GIT_PW", forgejo_pw);
+    std::env::set_var("GIT_ASKPASS", &askpass);
+    std::env::set_var("GIT_TERMINAL_PROMPT", "0");
+    let push_url = format!("http://{FORGEJO_USER}@localhost:3000/{FORGEJO_USER}/dabba-gitops.git");
     // Force: dabba's seed is the authoritative source, and each seed is a fresh
     // `git init` (unrelated history), so re-seeds must overwrite the existing branch.
-    run::run_quiet(
+    let push = run::run_quiet(
         "git",
         &["-C", cdir, "push", "-q", "--force", &push_url, "HEAD:main"],
-    )?;
+    );
+    std::env::remove_var("GIT_ASKPASS");
+    std::env::remove_var("DABBA_GIT_PW");
+    let _ = std::fs::remove_file(&askpass);
+    push?;
     let _ = std::fs::remove_dir_all(&src);
     Ok(())
 }

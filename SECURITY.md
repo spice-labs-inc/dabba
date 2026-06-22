@@ -30,8 +30,10 @@ local (tier-0) defaults are tuned for a laptop, not production. Know these trade
   single ephemeral pod backed by SQLite with no backup; losing the pod loses gitops history.
   It's reachable only in-cluster / via port-forward. For durable use, push-mirror it or point
   Flux at an external git host.
-- **Install integrity.** Release binaries are built and published by the project's GitHub
-  Actions release workflow. Verify what you download against the release before running it.
+- **Install integrity.** Release binaries are built and published from tagged commits by the
+  project's GitHub Actions release workflow. Signed checksums and SBOMs for release artifacts
+  are planned but not yet published; until then, if you need to verify provenance, build from
+  source (`cargo install --git https://github.com/spice-labs-inc/dabba`).
 
 ## Scope
 

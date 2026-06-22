@@ -18,6 +18,28 @@ pub fn run(bin: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Run with `input` written to stdin (so a secret travels via stdin, not the argv
+/// that `ps` / /proc exposes); inherit stdout/stderr; error on non-zero exit.
+pub fn run_stdin(bin: &str, args: &[&str], input: &str) -> Result<()> {
+    use std::io::Write;
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("spawning {bin}"))?;
+    child
+        .stdin
+        .take()
+        .context("capturing stdin")?
+        .write_all(input.as_bytes())
+        .with_context(|| format!("writing stdin to {bin}"))?;
+    let status = child.wait().with_context(|| format!("waiting for {bin}"))?;
+    if !status.success() {
+        bail!("`{bin} {}` failed", args.join(" "));
+    }
+    Ok(())
+}
+
 /// Run with stdout/stderr suppressed; error on non-zero exit.
 pub fn run_quiet(bin: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(bin)
