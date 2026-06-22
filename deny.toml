@@ -1,0 +1,29 @@
+# cargo-deny policy. See https://embarkstudios.github.io/cargo-deny/
+[advisories]
+version = 2
+# Fail on any unmaintained/vulnerable crate; refresh the DB each run.
+yanked = "deny"
+
+[licenses]
+version = 2
+# Permissive licenses only — dabba ships Apache-2.0.
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Flag multiple versions of the same crate (bloat / drift); warn, don't fail.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
