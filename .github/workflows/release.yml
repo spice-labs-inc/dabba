@@ -28,10 +28,6 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
-          # Native ARM runner — builds aarch64-linux directly instead of the slow
-          # Docker-based `cross` fallback (~12min → ~2-3min). Free for public repos.
-          - os: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
           - os: macos-latest
             target: aarch64-apple-darwin
           - os: windows-latest
@@ -44,11 +40,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # musl linker for the static Linux builds — native on both x86_64 and arm64
-      # (the arm64 build is now native, not the Docker `cross` path that bundled it).
-      - name: Install musl tools
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools
       # Builds the binary, archives it as dabba-<target>.tar.gz (.zip on Windows),
       # generates a .sha256 checksum, and uploads both to the release for this tag.
       - uses: taiki-e/upload-rust-binary-action@v1
@@ -65,8 +56,34 @@ jobs:
         with:
           subject-path: target/${{ matrix.target }}/release/dabba*
 
+  # aarch64 Linux is built natively on an ARM runner. taiki-e routes musl targets
+  # through `cross`, which is broken on ARM hosts (it tries to pull an x86_64
+  # toolchain) — so build directly. dabba is pure Rust, so the musl target links
+  # self-contained and static with no extra tooling.
+  build-aarch64-linux:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --bin dabba --target aarch64-unknown-linux-musl
+      - name: Package, checksum, and upload
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          name="dabba-aarch64-unknown-linux-musl"
+          tar -C target/aarch64-unknown-linux-musl/release -czf "$name.tar.gz" dabba
+          sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
+          gh release upload "$TAG" "$name.tar.gz" "$name.tar.gz.sha256" --clobber
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/aarch64-unknown-linux-musl/release/dabba
+
   sbom:
-    needs: build # the release exists once the builds have uploaded to it
+    needs: [build, build-aarch64-linux] # the release exists once the builds have uploaded
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
