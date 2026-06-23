@@ -52,7 +52,7 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
       # Signed SLSA build provenance for the binary (same mechanism the org's
       # action-attest-image uses for container images, here for the native binary).
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: target/${{ matrix.target }}/release/dabba*
 
@@ -78,7 +78,7 @@ jobs:
           tar -C target/aarch64-unknown-linux-musl/release -czf "$name.tar.gz" dabba
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
           gh release upload "$TAG" "$name.tar.gz" "$name.tar.gz.sha256" --clobber
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: target/aarch64-unknown-linux-musl/release/dabba
 
