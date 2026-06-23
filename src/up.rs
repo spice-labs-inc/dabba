@@ -25,6 +25,9 @@ pub struct Options {
 const FORGEJO_USER: &str = "dabba";
 const DEMO_MESSAGE: &str = "Hello from OpenBao — delivered through dabba";
 const WAIT_ATTEMPTS: usize = 120;
+/// dabba's platform needs Kubernetes >= 1.31 (external-secrets CRDs use
+/// `selectableFields`, added in 1.31). Only checked for bring-your-own clusters.
+const MIN_K8S_MINOR: u32 = 31;
 
 pub fn run(opts: &Options) -> Result<()> {
     let cfg = DabbaConfig::load(&opts.config)?;
@@ -86,6 +89,13 @@ pub fn run(opts: &Options) -> Result<()> {
 
     // export KUBECONFIG so every later kubectl/tofu inherits it.
     std::env::set_var("KUBECONFIG", &kubeconfig);
+
+    // For a bring-your-own cluster, fail fast if it's too old — otherwise the
+    // platform install dies with a cryptic CRD error minutes in. Provisioned
+    // substrates always get a new-enough version, so they skip this.
+    if env.substrate == Substrate::Existing {
+        check_k8s_version()?;
+    }
 
     // 02-bootstrap runs the same regardless of substrate. Localize its module
     // sources for local dev.
@@ -210,6 +220,34 @@ fn bootstrap_vars(env: &ResolvedEnv, kubeconfig: &Path) -> Vec<String> {
 fn set_tofu_secret_env(openbao_root: &str, forgejo_pw: &str) {
     std::env::set_var("TF_VAR_openbao_root_token", openbao_root);
     std::env::set_var("TF_VAR_forgejo_admin_password", forgejo_pw);
+}
+
+/// Bail if the (already-KUBECONFIG'd) cluster is older than the platform supports.
+/// `/version` is JSON, which serde_yaml parses (JSON is a YAML subset). If the
+/// version can't be read, don't block — `up` will surface any real error.
+fn check_k8s_version() -> Result<()> {
+    let Some(raw) = run::capture("kubectl", &["get", "--raw", "/version"]) else {
+        return Ok(());
+    };
+    let v: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap_or_default();
+    let major = v.get("major").and_then(|x| x.as_str()).unwrap_or("");
+    let minor: u32 = v
+        .get("minor")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    if major == "1" && minor > 0 && minor < MIN_K8S_MINOR {
+        bail!(
+            "this cluster is Kubernetes 1.{minor}, but dabba's platform needs >= 1.{MIN_K8S_MINOR} \
+             (external-secrets CRDs use selectableFields, added in 1.31). \
+             Upgrade the cluster, or point at a newer one."
+        );
+    }
+    Ok(())
 }
 
 /// Write a tiny `GIT_ASKPASS` helper that echoes `$DABBA_GIT_PW`, so the git password

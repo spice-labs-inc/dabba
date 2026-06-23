@@ -225,27 +225,104 @@ fn up_options(config: &Path, env: Option<String>, a: UpArgs) -> up::Options {
     }
 }
 
-/// Check the day-0 prerequisites are present.
+/// Minimum OpenTofu/Terraform version (the modules declare `required_version >= 1.6.0`).
+const MIN_TOFU: &str = "1.6.0";
+
+/// Check the day-0 prerequisites: tools present, the right versions, and (for
+/// docker) actually running.
 fn doctor() -> Result<()> {
-    let tools = ["docker", "kubectl", "tofu"];
-    let mut missing = Vec::new();
-    for t in tools {
-        let ok = on_path(t);
-        println!("  {} {}", if ok { "✓" } else { "✗" }, t);
-        if !ok {
-            missing.push(t);
-        }
+    let mut problems: Vec<String> = Vec::new();
+
+    // docker: on PATH AND the daemon is reachable (a stopped daemon is the classic trap).
+    if !on_path("docker") {
+        println!("  ✗ docker (not found)");
+        problems.push("docker not on PATH".into());
+    } else if !run::probe("docker", &["info"]) {
+        println!("  ✗ docker (installed, but the daemon isn't reachable — is it running?)");
+        problems.push("docker daemon not running".into());
+    } else {
+        println!("  ✓ docker");
     }
-    if missing.is_empty() {
+
+    // kubectl: presence is enough (it's tolerant of version skew).
+    if on_path("kubectl") {
+        println!("  ✓ kubectl");
+    } else {
+        println!("  ✗ kubectl (not found)");
+        problems.push("kubectl not on PATH".into());
+    }
+
+    // tofu: on PATH AND >= MIN_TOFU (an older tofu fails confusingly mid-`up`).
+    match tofu_version() {
+        None => {
+            println!("  ✗ tofu (not found)");
+            problems.push("tofu not on PATH".into());
+        }
+        Some(v) if version_lt(&v, MIN_TOFU) => {
+            println!("  ✗ tofu {v} (need >= {MIN_TOFU})");
+            problems.push(format!("tofu {v} is older than {MIN_TOFU}"));
+        }
+        Some(v) => println!("  ✓ tofu ({v})"),
+    }
+
+    if problems.is_empty() {
         println!("✓ preflight ok");
         Ok(())
     } else {
-        anyhow::bail!("missing prerequisites: {}", missing.join(", "))
+        anyhow::bail!("preflight failed: {}", problems.join("; "))
     }
+}
+
+/// The installed OpenTofu/Terraform version, e.g. "1.12.2" (first line of
+/// `tofu version` → "OpenTofu v1.12.2").
+fn tofu_version() -> Option<String> {
+    let out = run::capture("tofu", &["version"])?;
+    out.lines()
+        .next()?
+        .split_whitespace()
+        .nth(1)
+        .map(|s| s.trim_start_matches('v').to_string())
+}
+
+/// Parse a dotted version into a comparable tuple, ignoring any trailing suffix
+/// on each part (e.g. "31+" → 31).
+fn parse_semver(v: &str) -> (u32, u32, u32) {
+    let mut p = v.split('.').map(|part| {
+        part.chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .unwrap_or(0)
+    });
+    (
+        p.next().unwrap_or(0),
+        p.next().unwrap_or(0),
+        p.next().unwrap_or(0),
+    )
+}
+
+fn version_lt(a: &str, b: &str) -> bool {
+    parse_semver(a) < parse_semver(b)
 }
 
 /// True if `bin` is an executable file somewhere on PATH.
 fn on_path(bin: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_compare() {
+        assert!(version_lt("1.5.7", "1.6.0"));
+        assert!(version_lt("1.6.0", "1.12.2"));
+        assert!(!version_lt("1.6.0", "1.6.0"));
+        assert!(!version_lt("1.12.2", "1.6.0"));
+        // tolerant of trailing suffixes (e.g. a k8s minor like "31+")
+        assert_eq!(parse_semver("1.31+"), (1, 31, 0));
+        assert_eq!(parse_semver("v1.32.2"), (0, 32, 2)); // leading 'v' is stripped by callers
+    }
 }

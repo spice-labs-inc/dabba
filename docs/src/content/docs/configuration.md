@@ -52,6 +52,10 @@ environments:
     kubeconfig: ~/.kube/config
 ```
 
+The cluster must be **Kubernetes 1.31 or newer** (the platform's External Secrets CRDs use
+`selectableFields`, added in 1.31). `dabba up` checks this up front and stops with a clear
+message if the cluster is too old — provisioned substrates always get a new-enough version.
+
 ## Shared settings
 
 `tls.issuer` (selfsigned / acme), `gateway.exposure` (nodeport / loadbalancer), `git`,
