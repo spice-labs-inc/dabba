@@ -35,15 +35,28 @@ url="https://github.com/${REPO}/releases/latest/download/dabba-${target}.tar.gz"
 
 echo "📦 Installing dabba (${target}) to ${TARGET_DIR}"
 
-# ── Download + install the binary ────────────────────────────────────────────
+# ── Download + verify + install the binary ───────────────────────────────────
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-if ! curl -fsSL "$url" -o "$tmp/dabba.tar.gz"; then
+archive="dabba-${target}.tar.gz"
+if ! curl -fsSL "$url" -o "$tmp/$archive"; then
   echo "✗ could not download $url" >&2
   echo "  (no release asset for $target yet? see ${REPO}/releases)" >&2
   exit 1
 fi
-tar -xzf "$tmp/dabba.tar.gz" -C "$tmp"
+# Verify against the published SHA-256 checksum before trusting the binary.
+if curl -fsSL "$url.sha256" -o "$tmp/$archive.sha256" 2>/dev/null; then
+  if command -v sha256sum >/dev/null 2>&1; then sumcmd="sha256sum"; else sumcmd="shasum -a 256"; fi
+  if ( cd "$tmp" && $sumcmd -c "$archive.sha256" >/dev/null 2>&1 ); then
+    echo "✅ checksum verified"
+  else
+    echo "✗ checksum verification FAILED for $archive — refusing to install" >&2
+    exit 1
+  fi
+else
+  echo "⚠️  no published checksum for $archive — skipping verification"
+fi
+tar -xzf "$tmp/$archive" -C "$tmp"
 mkdir -p "$TARGET_DIR"
 install -m 0755 "$tmp/dabba" "$TARGET_DIR/dabba"
 echo "✅ dabba $("$TARGET_DIR/dabba" --version 2>/dev/null | awk '{print $2}') installed"

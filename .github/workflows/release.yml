@@ -1,7 +1,9 @@
 name: release
 
 # Builds the dabba binary for every supported platform and attaches it to the
-# GitHub Release for the pushed tag. install.sh / install.ps1 fetch these assets.
+# GitHub Release for the pushed tag, with a SHA-256 checksum + a signed build
+# provenance attestation per binary and an SBOM for the release. install.sh /
+# install.ps1 fetch these assets and verify the checksum.
 # Strict semver tags only (vX.Y.Z, no pre-release suffix) — matches the house
 # convention used across spice-labs-inc repos.
 on:
@@ -15,6 +17,8 @@ on:
 
 permissions:
   contents: write
+  id-token: write # keyless signing for the provenance attestation
+  attestations: write
 
 jobs:
   build:
@@ -38,12 +42,33 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      # Builds the binary for the target, archives it as dabba-<target>.tar.gz
-      # (.zip on Windows), and uploads it to the release for this tag.
+      # Builds the binary, archives it as dabba-<target>.tar.gz (.zip on Windows),
+      # generates a .sha256 checksum, and uploads both to the release for this tag.
       - uses: taiki-e/upload-rust-binary-action@v1
         with:
           bin: dabba
           target: ${{ matrix.target }}
           archive: dabba-$target
+          checksum: sha256
           ref: refs/tags/${{ github.event.inputs.tag || github.ref_name }}
           token: ${{ secrets.GITHUB_TOKEN }}
+      # Signed SLSA build provenance for the binary (same mechanism the org's
+      # action-attest-image uses for container images, here for the native binary).
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/${{ matrix.target }}/release/dabba*
+
+  sbom:
+    needs: build # the release exists once the builds have uploaded to it
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate SBOM (syft, SPDX)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh | sh -s -- -b /usr/local/bin
+          syft dir:. -o spdx-json > dabba.spdx.json
+      - name: Upload SBOM to the release
+        env:
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "$TAG" dabba.spdx.json --clobber
