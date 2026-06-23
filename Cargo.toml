@@ -13,5 +13,7 @@ path = "src/main.rs"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+# serde_yaml_ng is the maintained continuation of the now-archived serde_yaml;
+# imported under the serde_yaml name so the call sites are unchanged.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 anyhow = "1"
