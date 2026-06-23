@@ -28,6 +28,9 @@ jobs:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
+          # TODO after public: switch this to a native ARM runner (ubuntu-24.04-arm,
+          # free for public repos) — drops aarch64-linux from ~12min (Docker `cross`)
+          # to ~2-3min native.
           - os: ubuntu-latest
             target: aarch64-unknown-linux-musl
           - os: macos-latest

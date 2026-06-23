@@ -128,15 +128,31 @@ pub enum Exposure {
     Loadbalancer,
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Git {
     #[serde(default)]
     pub mode: GitMode,
-    #[serde(default)]
+    /// Where `dabba up` clones the gitops content from when no `--gitops-seed` is
+    /// given. Defaults to the canonical public dabba-gitops; override for a fork.
+    #[serde(default = "default_upstream")]
     pub upstream: String,
     #[serde(default)]
     pub push_mirror: PushMirror,
+}
+
+fn default_upstream() -> String {
+    "https://github.com/spice-labs-inc/dabba-gitops.git".into()
+}
+
+impl Default for Git {
+    fn default() -> Self {
+        Git {
+            mode: GitMode::default(),
+            upstream: default_upstream(),
+            push_mirror: PushMirror::default(),
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
