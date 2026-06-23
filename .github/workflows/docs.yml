@@ -24,7 +24,7 @@ jobs:
       run:
         working-directory: docs
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # Detects the real serving path/URL (root for private *.pages.github.io,
       # /dabba once public) so the asset base matches and styles don't 404.
       - uses: actions/configure-pages@v5
@@ -32,7 +32,7 @@ jobs:
       - uses: pnpm/action-setup@v4
         with:
           version: 11
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: pnpm
