@@ -33,7 +33,7 @@ jobs:
 
       - name: Assert the demo app serves the OpenBao-backed message
         run: |
-          export KUBECONFIG="$PWD/.dabba/kind/kubeconfig"
+          export KUBECONFIG="$(./target/release/dabba kubeconfig -c examples/local.yaml)"
           kubectl -n podinfo port-forward svc/podinfo 9898:9898 &
           pf=$!
           sleep 5
