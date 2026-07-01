@@ -180,6 +180,26 @@ pub fn down(opts: &DownOptions) -> Result<()> {
             let mut args = vec![c02arg.as_str(), "destroy", "-auto-approve", "-input=false"];
             args.extend(vars.iter().map(String::as_str));
             run::try_run("tofu", &args);
+
+            // Destroying flux-operator stops Flux before it can prune the namespaces
+            // it reconciled from gitops, so they leak on a BYO cluster we don't delete.
+            // Sweep the ones we own by label; tofu-managed namespaces (flux-system,
+            // git-server) were already removed by the destroy above.
+            log(&format!(
+                "[{}] removing leftover dabba namespaces",
+                env.name
+            ));
+            run::try_run(
+                "kubectl",
+                &[
+                    "delete",
+                    "namespace",
+                    "-l",
+                    "app.kubernetes.io/part-of=dabba",
+                    "--ignore-not-found",
+                    "--wait=false",
+                ],
+            );
         }
     } else if c01.join(".terraform").is_dir() {
         // Destroying the cluster removes everything in it.
@@ -1319,6 +1339,8 @@ fn unhealthy_pods() -> Vec<String> {
     struct Cs {
         #[serde(default)]
         state: CState,
+        #[serde(default, rename = "restartCount")]
+        restart_count: u32,
     }
     #[derive(serde::Deserialize, Default)]
     struct CState {
@@ -1335,44 +1357,65 @@ fn unhealthy_pods() -> Vec<String> {
         return vec![];
     };
     let list: List = serde_yaml::from_str(&yaml).unwrap_or(List { items: vec![] });
+    // The most recent error/panic/fatal line from a pod's logs — so the report
+    // carries the real cause, not just the state.
+    let error_line = |ns: &str, name: &str| -> String {
+        run::capture(
+            "kubectl",
+            &["-n", ns, "logs", name, "--tail=20", "--all-containers"],
+        )
+        .and_then(|l| {
+            l.lines()
+                .rev()
+                .find(|ln| {
+                    let lc = ln.to_lowercase();
+                    lc.contains("error") || lc.contains("panic") || lc.contains("fatal")
+                })
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or_default()
+    };
+    // A pod that keeps restarting is failing even when kubectl catches it mid-Running
+    // rather than in a waiting state (an app that starts, errors, and gets restarted).
+    const FLAPPING: u32 = 3;
     let mut out = Vec::new();
     for p in list.items {
         if p.status.phase == "Succeeded" {
             continue;
         }
-        for c in &p.status.cs {
-            let Some(w) = &c.state.waiting else { continue };
-            if bad.contains(&w.reason.as_str()) {
-                let ns = &p.metadata.namespace;
-                let log_line = run::capture(
-                    "kubectl",
-                    &[
-                        "-n",
-                        ns,
-                        "logs",
-                        &p.metadata.name,
-                        "--tail=20",
-                        "--all-containers",
-                    ],
-                )
-                .and_then(|l| {
-                    l.lines()
-                        .rev()
-                        .find(|ln| {
-                            let lc = ln.to_lowercase();
-                            lc.contains("error") || lc.contains("panic") || lc.contains("fatal")
-                        })
-                        .map(|s| s.trim().to_string())
-                })
-                .unwrap_or_default();
-                let detail = if log_line.is_empty() {
-                    w.reason.clone()
-                } else {
-                    format!("{} — {log_line}", w.reason)
-                };
-                out.push(format!("pod {ns}/{}: {detail}", p.metadata.name));
-                break;
-            }
+        let ns = &p.metadata.namespace;
+        if let Some(reason) = p
+            .status
+            .cs
+            .iter()
+            .filter_map(|c| c.state.waiting.as_ref())
+            .map(|w| w.reason.as_str())
+            .find(|r| bad.contains(r))
+        {
+            let ll = error_line(ns, &p.metadata.name);
+            let detail = if ll.is_empty() {
+                reason.to_string()
+            } else {
+                format!("{reason} — {ll}")
+            };
+            out.push(format!("pod {ns}/{}: {detail}", p.metadata.name));
+            continue;
+        }
+        let restarts = p
+            .status
+            .cs
+            .iter()
+            .map(|c| c.restart_count)
+            .max()
+            .unwrap_or(0);
+        if restarts >= FLAPPING {
+            let ll = error_line(ns, &p.metadata.name);
+            let detail = if ll.is_empty() {
+                format!("restarting ({restarts}x)")
+            } else {
+                format!("restarting ({restarts}x) — {ll}")
+            };
+            out.push(format!("pod {ns}/{}: {detail}", p.metadata.name));
         }
     }
     out
