@@ -3,9 +3,10 @@
 //! seed the gitops content into Forgejo, seed the demo secret into OpenBao, and wait
 //! for the platform to settle. Each env runs in its own `.dabba/<env>/` working dir.
 
-use crate::config::{DabbaConfig, Issuer, ResolvedEnv, Substrate};
+use crate::config::{DabbaConfig, Exposure, Issuer, ResolvedEnv, Substrate};
 use crate::run;
 use anyhow::{bail, Context, Result};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -24,7 +25,9 @@ pub struct Options {
 
 const FORGEJO_USER: &str = "dabba";
 const DEMO_MESSAGE: &str = "Hello from OpenBao — delivered through dabba";
-const WAIT_ATTEMPTS: usize = 120;
+// ~15 min ceiling on each readiness wait; polls return early on success, so this
+// only extends the slow case — cloud (Fargate) cold-starts need the headroom.
+const WAIT_ATTEMPTS: usize = 180;
 /// dabba's platform needs Kubernetes >= 1.31 (external-secrets CRDs use
 /// `selectableFields`, added in 1.31). Only checked for bring-your-own clusters.
 const MIN_K8S_MINOR: u32 = 31;
@@ -61,8 +64,11 @@ pub fn run(opts: &Options) -> Result<()> {
         log(&format!("[{}] using the provided kubeconfig", env.name));
         kc
     } else {
-        copy_stage(&template.join("01-cluster"), &c01)?;
         let substrate = substrate_dir(env.substrate)?;
+        // Cloud substrates need their own provider block, so they ship a separate
+        // 01-cluster template; the local substrates share one.
+        let stage = cluster_stage(env.substrate);
+        copy_stage(&template.join(stage), &c01)?;
         // Substrate selection (module source isn't a TF variable, so rewrite it).
         let source = match &opts.modules_source {
             Some(p) => format!("{p}/modules/{substrate}"),
@@ -74,16 +80,10 @@ pub fn run(opts: &Options) -> Result<()> {
         log(&format!("[{}] creating the {substrate} cluster", env.name));
         let c01arg = format!("-chdir={}", c01.display());
         run::run_quiet("tofu", &[&c01arg, "init", "-input=false"])?;
-        run::run(
-            "tofu",
-            &[
-                &c01arg,
-                "apply",
-                "-auto-approve",
-                "-input=false",
-                &format!("-var=cluster_name={}", env.name),
-            ],
-        )?;
+        let cvars = cluster_vars(&env);
+        let mut args = vec![c01arg.as_str(), "apply", "-auto-approve", "-input=false"];
+        args.extend(cvars.iter().map(String::as_str));
+        run::run("tofu", &args)?;
         workdir.join("kubeconfig") // 01-cluster writes ../kubeconfig = workdir/kubeconfig
     };
 
@@ -106,15 +106,28 @@ pub fn run(opts: &Options) -> Result<()> {
         "[{}] installing Forgejo and the Flux Operator",
         env.name
     ));
+    // For EKS the cluster-vars need the 01-cluster outputs (IRSA role arns, EFS id,
+    // VPC, region) so the cloud overlay's controllers can find them; empty otherwise.
+    let cloud_outputs = if env.substrate == Substrate::Eks {
+        read_tofu_outputs(&c01)
+    } else {
+        BTreeMap::new()
+    };
     let c02arg = format!("-chdir={}", c02.display());
     run::run_quiet("tofu", &[&c02arg, "init", "-input=false"])?;
     set_tofu_secret_env(&openbao_root, &forgejo_pw);
-    let vars = bootstrap_vars(&env, &kubeconfig);
+    let vars = bootstrap_vars(&env, &kubeconfig, &cloud_outputs);
     let mut args = vec![c02arg.as_str(), "apply", "-auto-approve", "-input=false"];
     args.extend(vars.iter().map(String::as_str));
     run::run("tofu", &args)?;
 
-    seed_forgejo(&cfg, opts, &forgejo_pw)?;
+    // EKS syncs the cloud cluster dir; the local substrates sync clusters/local.
+    let cluster_subdir = if env.substrate == Substrate::Eks {
+        "cloud"
+    } else {
+        "local"
+    };
+    seed_forgejo(&cfg, opts, &forgejo_pw, cluster_subdir)?;
     seed_openbao(&openbao_root, &forgejo_pw, &openobserve_pw)?;
     wait_for_reconciled(WAIT_ATTEMPTS)?;
     print_summary(&env, &kubeconfig);
@@ -176,7 +189,7 @@ pub fn down(opts: &DownOptions) -> Result<()> {
             let openbao_root = read_stash(&workdir, "openbao-root");
             let forgejo_pw = read_stash(&workdir, "forgejo-password");
             set_tofu_secret_env(&openbao_root, &forgejo_pw);
-            let vars = bootstrap_vars(&env, &kc);
+            let vars = bootstrap_vars(&env, &kc, &BTreeMap::new());
             let mut args = vec![c02arg.as_str(), "destroy", "-auto-approve", "-input=false"];
             args.extend(vars.iter().map(String::as_str));
             run::try_run("tofu", &args);
@@ -202,19 +215,19 @@ pub fn down(opts: &DownOptions) -> Result<()> {
             );
         }
     } else if c01.join(".terraform").is_dir() {
+        // A cloud load balancer + its DNS records are created by in-cluster
+        // controllers, not tofu. Release them before destroying the cluster, or the
+        // load balancer's ENIs block VPC deletion and the DNS records leak.
+        if is_cloud(env.substrate) {
+            release_cloud_ingress(&workdir);
+        }
         // Destroying the cluster removes everything in it.
         log(&format!("[{}] destroying the cluster", env.name));
         let c01arg = format!("-chdir={}", c01.display());
-        run::try_run(
-            "tofu",
-            &[
-                &c01arg,
-                "destroy",
-                "-auto-approve",
-                "-input=false",
-                &format!("-var=cluster_name={}", env.name),
-            ],
-        );
+        let cvars = cluster_vars(&env);
+        let mut args = vec![c01arg.as_str(), "destroy", "-auto-approve", "-input=false"];
+        args.extend(cvars.iter().map(String::as_str));
+        run::try_run("tofu", &args);
     }
 
     // Drop the whole per-env workdir (state, working copies, kubeconfig).
@@ -223,16 +236,144 @@ pub fn down(opts: &DownOptions) -> Result<()> {
     Ok(())
 }
 
+/// Substrates dabba provisions in a cloud (as opposed to a local VM/container),
+/// where load balancers and DNS records are managed by in-cluster controllers.
+fn is_cloud(s: Substrate) -> bool {
+    matches!(s, Substrate::Eks | Substrate::ScalewayKapsule)
+}
+
+/// Delete the in-cluster objects that own cloud load balancers and DNS records —
+/// Gateways/HTTPRoutes (external-dns removes their records) and LoadBalancer
+/// Services (the load-balancer controller removes the LB) — and wait for the LB to
+/// be released, so a later `tofu destroy` of the VPC doesn't hit the LB's ENIs.
+/// Flux is suspended first so it can't recreate them mid-teardown. Best-effort.
+fn release_cloud_ingress(workdir: &Path) {
+    let kc = workdir.join("kubeconfig");
+    if !kc.exists() {
+        return;
+    }
+    std::env::set_var("KUBECONFIG", &kc);
+    log("releasing the cloud load balancer + DNS records before destroy");
+    for k in ["crds", "platform", "demo", "observability"] {
+        run::try_run(
+            "kubectl",
+            &[
+                "-n",
+                "flux-system",
+                "patch",
+                "kustomization",
+                k,
+                "--type",
+                "merge",
+                "-p",
+                r#"{"spec":{"suspend":true}}"#,
+            ],
+        );
+    }
+    run::try_run(
+        "kubectl",
+        &[
+            "delete",
+            "gateway,httproute",
+            "-A",
+            "--all",
+            "--ignore-not-found",
+            "--wait=false",
+        ],
+    );
+    run::try_run(
+        "kubectl",
+        &[
+            "delete",
+            "svc",
+            "-A",
+            "--field-selector",
+            "spec.type=LoadBalancer",
+            "--ignore-not-found",
+            "--wait=false",
+        ],
+    );
+    // The LoadBalancer Service keeps a finalizer until the controller has deleted
+    // the load balancer, so "no LoadBalancer Services left" means the LB is gone.
+    let _ = run::wait_for("cloud load balancer release", 60, || {
+        run::capture(
+            "kubectl",
+            &[
+                "get",
+                "svc",
+                "-A",
+                "--field-selector",
+                "spec.type=LoadBalancer",
+                "-o",
+                "name",
+            ],
+        )
+        .map(|s| s.trim().is_empty())
+        .unwrap_or(false)
+    });
+}
+
 /// The -var args 02-bootstrap needs — shared by `up` (apply) and `down` (destroy).
 /// For one-cluster-per-env, `cluster` and `environment` are both the env name.
-fn bootstrap_vars(env: &ResolvedEnv, kubeconfig: &Path) -> Vec<String> {
-    vec![
+/// EKS additionally threads the 01-cluster outputs (`cloud`) + the Route53 zone and
+/// ACME email into the cluster-vars the cloud overlay substitutes.
+fn bootstrap_vars(
+    env: &ResolvedEnv,
+    kubeconfig: &Path,
+    cloud: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let sync_path = if env.substrate == Substrate::Eks {
+        "clusters/cloud"
+    } else {
+        "clusters/local"
+    };
+    let mut v = vec![
         format!("-var=kubeconfig_path={}", kubeconfig.display()),
         format!("-var=domain={}", env.domain),
         format!("-var=cluster_issuer={}", issuer_name(env.issuer)),
         format!("-var=cluster_name={}", env.name),
         format!("-var=environment={}", env.name),
-    ]
+        format!("-var=sync_path={sync_path}"),
+    ];
+    if env.substrate == Substrate::Eks {
+        v.push(format!("-var=acme_email={}", env.acme_email));
+        v.push(format!(
+            "-var=route53_zone_id={}",
+            env.substrate_str("route53ZoneId", "")
+        ));
+        // region, vpc_id and the IRSA role arns come from the 01-cluster outputs.
+        for key in [
+            "region",
+            "vpc_id",
+            "lb_controller_role_arn",
+            "external_dns_role_arn",
+            "cert_manager_role_arn",
+        ] {
+            if let Some(val) = cloud.get(key) {
+                v.push(format!("-var={key}={val}"));
+            }
+        }
+    }
+    v
+}
+
+/// Read `tofu output -json` from a stage dir into a flat key->string map (skipping
+/// any non-string outputs) — how the eks 01-cluster outputs reach 02-bootstrap.
+fn read_tofu_outputs(chdir: &Path) -> BTreeMap<String, String> {
+    let chdir_arg = format!("-chdir={}", chdir.display());
+    let mut out = BTreeMap::new();
+    let Some(json) = run::capture("tofu", &[&chdir_arg, "output", "-json"]) else {
+        return out;
+    };
+    let v: serde_yaml::Value = serde_yaml::from_str(&json).unwrap_or_default();
+    if let Some(map) = v.as_mapping() {
+        for (k, val) in map {
+            if let (Some(k), Some(s)) = (k.as_str(), val.get("value").and_then(|x| x.as_str())) {
+                out.insert(k.to_string(), s.to_string());
+            }
+        }
+    }
+    out
 }
 
 /// Pass the secret tofu vars via `TF_VAR_*` env rather than `-var=` on the command
@@ -411,10 +552,11 @@ pub fn status(config: &Path, env_name: Option<&str>) -> Result<()> {
         }
     }
 
+    let sfx = gateway_port_suffix(&env);
     println!("\n  endpoints:");
-    println!("    demo app:    https://podinfo.{}:31443", env.domain);
+    println!("    demo app:    https://podinfo.{}{sfx}", env.domain);
     if cfg.spec.observability.enabled {
-        println!("    openobserve: https://o2.{}:31443", env.domain);
+        println!("    openobserve: https://o2.{}{sfx}", env.domain);
     }
     Ok(())
 }
@@ -759,7 +901,11 @@ fn render_ascii(env: &ResolvedEnv, ksts: &[(String, bool)], hrs: &[(String, bool
         println!("      (none yet)");
     }
     println!("\n  secret path:  OpenBao ──► External Secrets ──► app");
-    println!("  gateway:      https://podinfo.{}:31443", env.domain);
+    println!(
+        "  gateway:      https://podinfo.{}{}",
+        env.domain,
+        gateway_port_suffix(env)
+    );
 }
 
 fn render_mermaid(env: &ResolvedEnv, ksts: &[(String, bool)], hrs: &[(String, bool, String)]) {
@@ -839,12 +985,27 @@ fn preflight(env: &ResolvedEnv, workdir: &Path) -> Result<()> {
             bail!("{t} not found on PATH");
         }
     }
-    if !run::probe("docker", &["info"]) {
+    let local = matches!(
+        env.substrate,
+        Substrate::Kind | Substrate::K3d | Substrate::Minikube
+    );
+    // EKS reaches the cluster through `aws eks get-token`, and provisioning needs
+    // working credentials — fail fast rather than deep in a tofu apply.
+    if env.substrate == Substrate::Eks {
+        if !on_path("aws") {
+            bail!("aws CLI not found on PATH (the EKS kubeconfig uses `aws eks get-token`)");
+        }
+        if !run::probe("aws", &["sts", "get-caller-identity"]) {
+            bail!("aws credentials are not usable — configure AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY (or ~/.aws) and retry");
+        }
+    }
+    // Only the local substrates run in a local Docker daemon.
+    if local && !run::probe("docker", &["info"]) {
         bail!("docker is not running — start Docker and retry");
     }
     heal_ghcr_token();
-    if env.substrate != Substrate::Existing {
-        // These only apply to a FRESH provision. On a resume our own cluster
+    if local {
+        // These only apply to a FRESH local provision. On a resume our own cluster
         // legitimately holds the name and the gateway ports, so skip them.
         let c01 = workdir.join("01-cluster");
         let fresh = !c01.join("terraform.tfstate").exists() && !c01.join(".terraform").is_dir();
@@ -977,7 +1138,12 @@ fn check_gateway_ports() -> Result<()> {
     Ok(())
 }
 
-fn seed_forgejo(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Result<()> {
+fn seed_forgejo(
+    cfg: &DabbaConfig,
+    opts: &Options,
+    forgejo_pw: &str,
+    cluster_subdir: &str,
+) -> Result<()> {
     log("Loading the gitops content into Forgejo");
     run::wait_for("forgejo service", WAIT_ATTEMPTS, || {
         run::probe(
@@ -997,7 +1163,7 @@ fn seed_forgejo(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Result<(
         ],
     )?;
     // Kill the port-forward whether seeding succeeds or fails.
-    let result = seed_forgejo_inner(cfg, opts, forgejo_pw);
+    let result = seed_forgejo_inner(cfg, opts, forgejo_pw, cluster_subdir);
     let _ = pf.kill();
     result?;
 
@@ -1016,7 +1182,12 @@ fn seed_forgejo(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Result<(
     Ok(())
 }
 
-fn seed_forgejo_inner(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Result<()> {
+fn seed_forgejo_inner(
+    cfg: &DabbaConfig,
+    opts: &Options,
+    forgejo_pw: &str,
+    cluster_subdir: &str,
+) -> Result<()> {
     run::wait_for("forgejo api", WAIT_ATTEMPTS, || {
         run::probe(
             "curl",
@@ -1065,7 +1236,7 @@ fn seed_forgejo_inner(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Re
         }
     }
     let _ = std::fs::remove_dir_all(src.join(".git"));
-    render_cluster_selection(&src, cfg)?;
+    render_cluster_selection(&src, cfg, cluster_subdir)?;
 
     let cdir = src_str.as_str();
     run::run_quiet("git", &["-C", cdir, "init", "-q"])?;
@@ -1108,8 +1279,8 @@ fn seed_forgejo_inner(cfg: &DabbaConfig, opts: &Options, forgejo_pw: &str) -> Re
 /// Render the dabba-MANAGED selection of active Flux Kustomizations from the config,
 /// into the seeded gitops (generated; overwrites clusters/local/kustomization.yml).
 /// Component manifests stay hand-authored; only this selection is generated.
-fn render_cluster_selection(seed: &Path, cfg: &DabbaConfig) -> Result<()> {
-    let ksum = seed.join("clusters/local/kustomization.yml");
+fn render_cluster_selection(seed: &Path, cfg: &DabbaConfig, cluster_subdir: &str) -> Result<()> {
+    let ksum = seed.join(format!("clusters/{cluster_subdir}/kustomization.yml"));
     if !ksum.exists() {
         return Ok(()); // not the tier-0 layout — nothing to render
     }
@@ -1422,15 +1593,22 @@ fn unhealthy_pods() -> Vec<String> {
 }
 
 fn print_summary(env: &ResolvedEnv, kubeconfig: &Path) {
+    let sfx = gateway_port_suffix(env);
+    let tls_note = match env.issuer {
+        Issuer::Selfsigned => {
+            "TLS uses a self-signed CA, so your browser will warn — that is expected."
+        }
+        Issuer::Acme => "TLS is a trusted Let's Encrypt certificate.",
+    };
     println!(
         "\n✓ {name} ready\n\n  \
-         demo app:    https://podinfo.{domain}:31443   (the banner is served from OpenBao)\n  \
-         openbao ui:  https://bao.{domain}:31443        token: dabba secret get local/openbao-root\n  \
+         demo app:    https://podinfo.{domain}{sfx}   (the banner is served from OpenBao)\n  \
+         openbao ui:  https://bao.{domain}{sfx}        token: dabba secret get local/openbao-root\n  \
          git server:  kubectl -n git-server port-forward svc/forgejo-http 3000:3000\n               \
          then http://localhost:3000  (user {user}; pw: dabba secret get dabba/forgejo)\n  \
          flux:        KUBECONFIG={kube} flux get kustomizations\n\n  \
          credentials are per-env random (no shipped defaults) — `dabba secret ls` / `dabba secret get`\n  \
-         TLS uses a self-signed CA, so your browser will warn — that is expected.\n  \
+         {tls_note}\n  \
          teardown:    dabba env {name} down",
         name = env.name,
         domain = env.domain,
@@ -1444,12 +1622,62 @@ fn substrate_dir(s: Substrate) -> Result<&'static str> {
         Substrate::Kind => "kind",
         Substrate::K3d => "k3d",
         Substrate::Minikube => "minikube",
-        Substrate::ScalewayKapsule | Substrate::Eks => {
-            bail!("cloud substrates (Tier 1) are not built yet")
-        }
+        Substrate::Eks => "eks-fargate",
+        Substrate::ScalewayKapsule => bail!("the scaleway substrate (Tier 1) is not built yet"),
         // Existing is handled before this is called (no provisioning module).
         Substrate::Existing => bail!("existing substrate has no provisioning module"),
     })
+}
+
+/// Which 01-cluster template a substrate provisions from. Cloud substrates declare
+/// their own provider, so they ship a separate template; the local ones share one.
+fn cluster_stage(s: Substrate) -> &'static str {
+    match s {
+        Substrate::Eks => "01-cluster-eks",
+        _ => "01-cluster",
+    }
+}
+
+/// The `-var` args the 01-cluster stage needs on apply and destroy. Every substrate
+/// takes the cluster name; EKS also takes its cloud knobs (region, k8s version, and
+/// the Route53 zone that arms external-dns/cert-manager) from `substrateConfig`.
+fn cluster_vars(env: &ResolvedEnv) -> Vec<String> {
+    let mut v = vec![format!("-var=cluster_name={}", env.name)];
+    if env.substrate == Substrate::Eks {
+        v.push(format!(
+            "-var=region={}",
+            env.substrate_str("region", "us-east-1")
+        ));
+        v.push(format!(
+            "-var=k8s_version={}",
+            env.substrate_str("k8sVersion", "1.31")
+        ));
+        v.push(format!(
+            "-var=route53_zone_id={}",
+            env.substrate_str("route53ZoneId", "")
+        ));
+        // Optional bring-your-own VPC (empty = provision a dedicated one).
+        v.push(format!("-var=vpc_id={}", env.substrate_str("vpcId", "")));
+        v.push(format!(
+            "-var=private_subnet_ids={}",
+            hcl_list(&env.substrate_list("privateSubnetIds"))
+        ));
+        v.push(format!(
+            "-var=public_subnet_ids={}",
+            hcl_list(&env.substrate_list("publicSubnetIds"))
+        ));
+    }
+    v
+}
+
+/// Format a string list as an HCL list literal for a tofu `-var` (e.g. `["a","b"]`).
+fn hcl_list(items: &[String]) -> String {
+    let inner = items
+        .iter()
+        .map(|s| format!("\"{s}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{inner}]")
 }
 
 /// Expand a leading `~/` to $HOME; otherwise pass through unchanged.
@@ -1466,6 +1694,15 @@ fn issuer_name(i: Issuer) -> &'static str {
     match i {
         Issuer::Selfsigned => "dabba-ca",
         Issuer::Acme => "letsencrypt",
+    }
+}
+
+/// URL port suffix for a gateway endpoint: a cloud LoadBalancer serves on 443, a
+/// local NodePort cluster maps the gateway to the host's :31443.
+fn gateway_port_suffix(env: &ResolvedEnv) -> &'static str {
+    match env.exposure {
+        Exposure::Loadbalancer => "",
+        Exposure::Nodeport => ":31443",
     }
 }
 

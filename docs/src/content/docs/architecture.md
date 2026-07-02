@@ -58,5 +58,5 @@ misleading "ready".
 | Tier | What |
 |------|------|
 | 0 | Local — kind / k3d / minikube, self-contained, self-signed TLS. **Available now.** |
-| 1 | Cloud — managed Kubernetes, real DNS + ACME TLS, production secret backends. *Roadmap.* |
+| 1 | Cloud — AWS Fargate EKS, real DNS (external-dns) + ACME TLS via Route53, a load-balancer gateway. **Available now** (`substrate: eks`). |
 | 2 | Multi-cluster, shared-services git hub, PR-driven applies. *Roadmap.* |

@@ -69,7 +69,7 @@ The config ships three local environments (`kind`/`k3d`/`minikube`); `dabba ls` 
 
 ```
 dabba (this repo)        the CLI, the quickstart, the docs
-dabba-modules            OpenTofu modules (kind / k3d / minikube, git server, flux operator)
+dabba-modules            OpenTofu modules (kind / k3d / minikube / eks-fargate, git server, flux operator)
 dabba-gitops             the platform as gitops (clusters / crds / platform / use-cases)
 ```
 
@@ -96,8 +96,9 @@ enough to read and run by hand; the CLI is a convenience over them.
 dabba is built in tiers; every tier uses the same modules and the same gitops repo:
 
 - **Tier 0 — local**: the quickstart above. The real platform, just small.
-- **Tier 1 — a cloud environment**: the same definition against a managed cluster, with a cloud
-  overlay (real DNS, ACME certs, an external OpenBao). *(in progress)*
+- **Tier 1 — a cloud environment**: the same definition on AWS Fargate EKS (`substrate: eks`),
+  with a cloud overlay — real DNS via external-dns, ACME certificates through Route53, and a
+  load-balancer gateway.
 - **Tier 2 — scaling up**: PR-driven, multi-environment delivery. *(in progress)*
 
 Full documentation: **[spice-labs-inc.github.io/dabba](https://spice-labs-inc.github.io/dabba/)**.
