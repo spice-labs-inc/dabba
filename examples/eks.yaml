@@ -1,0 +1,36 @@
+# AWS Fargate EKS — the first cloud substrate. dabba provisions a VPC + EKS
+# cluster running entirely on Fargate, then installs the same platform it runs
+# locally. Needs the aws CLI on PATH and working AWS credentials
+# (AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY or ~/.aws).
+#   dabba up
+#
+# DNS + TLS: real Let's Encrypt certs via Route53 DNS-01, on the delegated zone
+# eks.spice-labs.dev. Leave route53ZoneId empty to bring the cluster up with
+# self-signed TLS on the load balancer hostname until a zone is delegated.
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: DabbaConfig
+metadata:
+  name: dabba
+spec:
+  domain: eks.spice-labs.dev
+  tls:
+    issuer: acme # real certs via ACME Route53 DNS-01
+    acme:
+      email: platform@spice-labs.dev
+  gateway:
+    exposure: loadbalancer # ACME + cloud ingress need a real load balancer
+  environments:
+    - name: eks
+      substrate: eks
+      substrateConfig:
+        region: us-east-1
+        k8sVersion: "1.31"
+        route53ZoneId: Z07308502P3WT0UNJI2U3 # eks.spice-labs.dev
+        # By default dabba provisions a dedicated VPC. To reuse an existing one,
+        # set vpcId and both subnet lists (subnets must carry the EKS role tags
+        # kubernetes.io/role/internal-elb and kubernetes.io/role/elb):
+        # vpcId: vpc-0abc123
+        # privateSubnetIds: [subnet-0aaa, subnet-0bbb]
+        # publicSubnetIds: [subnet-0ccc, subnet-0ddd]
+  useCases:
+    - demo

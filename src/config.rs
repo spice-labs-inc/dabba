@@ -260,6 +260,35 @@ pub struct ResolvedEnv {
     pub kubeconfig: Option<String>,
     pub domain: String,
     pub issuer: Issuer,
+    pub exposure: Exposure,
+    /// ACME account email (from spec.tls.acme.email); empty when not using ACME.
+    pub acme_email: String,
+    pub substrate_config: serde_yaml::Value,
+}
+
+impl ResolvedEnv {
+    /// Read a string field out of `substrate_config` (the free-form per-substrate
+    /// knobs), falling back to `default` when it is absent or not a string.
+    pub fn substrate_str(&self, key: &str, default: &str) -> String {
+        self.substrate_config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .unwrap_or(default)
+            .to_string()
+    }
+
+    /// Read a string-list field out of `substrate_config` (empty when absent).
+    pub fn substrate_list(&self, key: &str) -> Vec<String> {
+        self.substrate_config
+            .get(key)
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl DabbaConfig {
@@ -372,6 +401,16 @@ impl DabbaConfig {
                 .clone()
                 .unwrap_or_else(|| self.spec.domain.clone()),
             issuer: self.spec.tls.issuer,
+            exposure: self.spec.gateway.exposure,
+            acme_email: self
+                .spec
+                .tls
+                .acme
+                .get("email")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            substrate_config: env.substrate_config.clone(),
         })
     }
 }
