@@ -9,10 +9,10 @@
 //!   config: config validate | show
 //!   shell:  completions <shell>
 
+mod backend;
 mod config;
 mod edit;
 mod run;
-mod up;
 
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -171,19 +171,24 @@ fn main() -> Result<()> {
             }
         },
         Command::Doctor => doctor(),
-        Command::Up(a) => up::run(&up_options(&cfg, None, a)),
-        Command::Down => up::down(&up::DownOptions {
+        Command::Up(a) => backend::select(&cfg, None)?.up(&up_options(&cfg, None, a)),
+        Command::Down => backend::select(&cfg, None)?.down(&backend::DownOptions {
             config: cfg,
             env: None,
         }),
-        Command::Status => up::status(&cfg, None),
-        Command::Kubeconfig { export } => up::kubeconfig(&cfg, None, export),
-        Command::Diagram { mermaid } => up::diagram(&cfg, None, mermaid),
-        Command::Secret { action } => match action {
-            SecretAction::Ls { path } => up::secret_ls(&cfg, None, path.as_deref()),
-            SecretAction::Get { name } => up::secret_get(&cfg, None, &name),
-        },
-        Command::Ls => up::ls(&cfg),
+        Command::Status => backend::select(&cfg, None)?.status(&cfg, None),
+        // `kubeconfig` is a Kubernetes concept, not a Backend verb — dispatch it
+        // straight to the k8s backend (a docker-host env reports "not deployed").
+        Command::Kubeconfig { export } => backend::kubernetes::kubeconfig(&cfg, None, export),
+        Command::Diagram { mermaid } => backend::select(&cfg, None)?.diagram(&cfg, None, mermaid),
+        Command::Secret { action } => {
+            let b = backend::select(&cfg, None)?;
+            match action {
+                SecretAction::Ls { path } => b.secret_ls(&cfg, None, path.as_deref()),
+                SecretAction::Get { name } => b.secret_get(&cfg, None, &name),
+            }
+        }
+        Command::Ls => backend::common::ls(&cfg),
         Command::Use { name } => edit::use_env(&cfg, &name),
         Command::Init => edit::init(&cfg),
         Command::Env { name, action } => dispatch_env(&cfg, &name, action),
@@ -199,15 +204,21 @@ fn main() -> Result<()> {
 fn dispatch_env(config: &Path, name: &str, action: Option<EnvAction>) -> Result<()> {
     let env = Some(name.to_string());
     match action {
-        None => up::show(config, name),
-        Some(EnvAction::Up(a)) => up::run(&up_options(config, env, a)),
-        Some(EnvAction::Down) => up::down(&up::DownOptions {
+        None => backend::common::show(config, name),
+        Some(EnvAction::Up(a)) => {
+            backend::select(config, Some(name))?.up(&up_options(config, env, a))
+        }
+        Some(EnvAction::Down) => backend::select(config, Some(name))?.down(&backend::DownOptions {
             config: config.to_path_buf(),
             env,
         }),
-        Some(EnvAction::Status) => up::status(config, Some(name)),
-        Some(EnvAction::Kubeconfig { export }) => up::kubeconfig(config, Some(name), export),
-        Some(EnvAction::Diagram { mermaid }) => up::diagram(config, Some(name), mermaid),
+        Some(EnvAction::Status) => backend::select(config, Some(name))?.status(config, Some(name)),
+        Some(EnvAction::Kubeconfig { export }) => {
+            backend::kubernetes::kubeconfig(config, Some(name), export)
+        }
+        Some(EnvAction::Diagram { mermaid }) => {
+            backend::select(config, Some(name))?.diagram(config, Some(name), mermaid)
+        }
         Some(EnvAction::Add { substrate, domain }) => {
             edit::add_env(config, name, &substrate, domain.as_deref())
         }
@@ -215,8 +226,8 @@ fn dispatch_env(config: &Path, name: &str, action: Option<EnvAction>) -> Result<
     }
 }
 
-fn up_options(config: &Path, env: Option<String>, a: UpArgs) -> up::Options {
-    up::Options {
+fn up_options(config: &Path, env: Option<String>, a: UpArgs) -> backend::Options {
+    backend::Options {
         config: config.to_path_buf(),
         env,
         quickstart_dir: a.quickstart_dir,

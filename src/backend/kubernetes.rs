@@ -1,8 +1,14 @@
-//! `dabba up`/`down`/`status`/`kubeconfig` — the per-environment lifecycle. `up` is
-//! the day-0 bootstrap: provision the substrate, install Forgejo + the Flux Operator,
-//! seed the gitops content into Forgejo, seed the demo secret into OpenBao, and wait
-//! for the platform to settle. Each env runs in its own `.dabba/<env>/` working dir.
+//! `KubernetesBackend` — dabba's original day-0 lifecycle, now behind the
+//! `Backend` trait. `up` provisions the substrate (tofu), installs Forgejo + the
+//! Flux Operator, seeds the gitops content into Forgejo and the demo secret into
+//! OpenBao, then waits for the platform to settle; `down`/`status`/`diagram`/
+//! `secret ls`/`secret get` read or tear down that same environment. Every env runs
+//! in its own `.dabba/<env>/` working dir. This is a faithful extraction of the
+//! former `up.rs`: the flow is unchanged, only the backend-neutral helpers moved to
+//! `backend::common`.
 
+use crate::backend::common::{env_secret, env_workdir, expand_tilde, log, on_path, read_stash};
+use crate::backend::{Backend, DownOptions, Options};
 use crate::config::{DabbaConfig, Exposure, Issuer, ResolvedEnv, Substrate};
 use crate::run;
 use anyhow::{bail, Context, Result};
@@ -10,17 +16,28 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct Options {
-    pub config: PathBuf,
-    /// Which environment to act on; None → the config's default.
-    pub env: Option<String>,
-    pub quickstart_dir: PathBuf,
-    /// Override module sources: a local path (dev) → `<path>/modules/<substrate>`;
-    /// None → the public git ref.
-    pub modules_source: Option<String>,
-    /// Local gitops content to seed Forgejo from (air-gapped/dev). None → clone the
-    /// config's git.upstream.
-    pub gitops_seed: Option<PathBuf>,
+/// The original tofu/Flux flow. Selected for every substrate except `docker-host`.
+pub struct KubernetesBackend;
+
+impl Backend for KubernetesBackend {
+    fn up(&self, opts: &Options) -> Result<()> {
+        run(opts)
+    }
+    fn down(&self, opts: &DownOptions) -> Result<()> {
+        down(opts)
+    }
+    fn status(&self, config: &Path, env_name: Option<&str>) -> Result<()> {
+        status(config, env_name)
+    }
+    fn diagram(&self, config: &Path, env_name: Option<&str>, mermaid: bool) -> Result<()> {
+        diagram(config, env_name, mermaid)
+    }
+    fn secret_ls(&self, config: &Path, env_name: Option<&str>, path: Option<&str>) -> Result<()> {
+        secret_ls(config, env_name, path)
+    }
+    fn secret_get(&self, config: &Path, env_name: Option<&str>, name: &str) -> Result<()> {
+        secret_get(config, env_name, name)
+    }
 }
 
 const FORGEJO_USER: &str = "dabba";
@@ -134,18 +151,6 @@ pub fn run(opts: &Options) -> Result<()> {
     Ok(())
 }
 
-/// `<config dir>/.dabba/<env>` — the per-env working dir (tofu state + kubeconfig).
-fn env_workdir(config: &Path, env_name: &str) -> Result<PathBuf> {
-    let base = config
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join(".dabba").join(env_name);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
-}
-
 /// Copy a quickstart stage template into the per-env workdir, overwriting the .tf
 /// but leaving any existing state/.terraform in place.
 fn copy_stage(src: &Path, dest: &Path) -> Result<()> {
@@ -158,11 +163,6 @@ fn copy_stage(src: &Path, dest: &Path) -> Result<()> {
             &dest.display().to_string(),
         ],
     )
-}
-
-pub struct DownOptions {
-    pub config: PathBuf,
-    pub env: Option<String>,
 }
 
 /// `dabba down` — the inverse of `up`. For a provisioned substrate, destroy the
@@ -423,50 +423,6 @@ fn write_askpass() -> Result<PathBuf> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
     }
     Ok(path)
-}
-
-/// Read-or-generate a per-env secret stashed in the workdir (0600). Reused across
-/// re-ups so the value is stable for the life of the env. `complex` adds a fixed
-/// upper/digit/special suffix to satisfy app password policies (e.g. OpenObserve).
-fn env_secret(workdir: &Path, name: &str, complex: bool) -> Result<String> {
-    let path = workdir.join(name);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
-            return Ok(existing);
-        }
-    }
-    // The entropy is in the hex; the suffix only satisfies complexity policies.
-    let val = if complex {
-        format!("{}Aa1!", random_token(24)?)
-    } else {
-        random_token(24)?
-    };
-    std::fs::write(&path, &val).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(val)
-}
-
-/// Read a stashed per-env secret (empty string if absent) — for `down`, which must
-/// not generate.
-fn read_stash(workdir: &Path, name: &str) -> String {
-    std::fs::read_to_string(workdir.join(name))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// `nbytes` of OS randomness as a lowercase hex string. Bails if `/dev/urandom`
-/// can't be read — a silent all-zeros token would be a catastrophic secret.
-fn random_token(nbytes: usize) -> Result<String> {
-    use std::io::Read;
-    let mut buf = vec![0u8; nbytes];
-    let mut f = std::fs::File::open("/dev/urandom").context("opening /dev/urandom")?;
-    f.read_exact(&mut buf).context("reading /dev/urandom")?;
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `dabba status` — for the given env: is it deployed, and how is Flux reconciling?
@@ -777,30 +733,6 @@ fn bao(token: &str, cmd: &str) -> Result<()> {
     )
 }
 
-/// `dabba ls` — list the configured environments and which one is the default.
-pub fn ls(config: &Path) -> Result<()> {
-    let cfg = DabbaConfig::load(config)?;
-    let default = cfg.default_env_name().ok();
-    for env in &cfg.spec.environments {
-        let marker = if Some(env.name.as_str()) == default {
-            "*"
-        } else {
-            " "
-        };
-        let deployed = env_workdir(config, &env.name)
-            .ok()
-            .map(|w| w.join("01-cluster").join(".terraform").is_dir() || env.kubeconfig.is_some())
-            .unwrap_or(false);
-        println!(
-            "{marker} {:<16} {:?}{}",
-            env.name,
-            env.substrate,
-            if deployed { "  (deployed)" } else { "" }
-        );
-    }
-    Ok(())
-}
-
 /// `dabba diagram` — the visual half of `status`: render the env's live topology
 /// (Flux Kustomizations + HelmReleases with health) as Mermaid (default) or ASCII.
 pub fn diagram(config: &Path, env_name: Option<&str>, mermaid: bool) -> Result<()> {
@@ -952,20 +884,6 @@ fn render_mermaid(env: &ResolvedEnv, ksts: &[(String, bool)], hrs: &[(String, bo
     if !bad.is_empty() {
         println!("  class {} bad;", bad.join(","));
     }
-}
-
-/// `dabba env <name>` (no verb) — show the env's resolved config.
-pub fn show(config: &Path, env_name: &str) -> Result<()> {
-    let cfg = DabbaConfig::load(config)?;
-    let env = cfg.resolve(Some(env_name))?;
-    println!("name:       {}", env.name);
-    println!("substrate:  {:?}", env.substrate);
-    println!("domain:     {}", env.domain);
-    println!("issuer:     {:?}", env.issuer);
-    if let Some(kc) = &env.kubeconfig {
-        println!("kubeconfig: {kc}");
-    }
-    Ok(())
 }
 
 /// The kubeconfig for an env: the BYO path for `existing`, else the per-env
@@ -1680,16 +1598,6 @@ fn hcl_list(items: &[String]) -> String {
     format!("[{inner}]")
 }
 
-/// Expand a leading `~/` to $HOME; otherwise pass through unchanged.
-fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(p)
-}
-
 fn issuer_name(i: Issuer) -> &'static str {
     match i {
         Issuer::Selfsigned => "dabba-ca",
@@ -1765,18 +1673,9 @@ fn module_name_in(line: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-}
-
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
-}
-
-fn log(msg: &str) {
-    eprintln!("▸ {msg}");
 }
