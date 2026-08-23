@@ -10,8 +10,21 @@ make that work.
 
 Provisioning (kind / k3d / minikube / cloud) and configuring (the platform) are separated by a
 single interface: a **kubeconfig**. The provision step outputs one; the configure step takes
-only that. So moving to a new substrate changes only the provisioning module — everything above
-the kubeconfig (Flux, gateway, TLS, secrets, apps) is identical.
+only that. So moving between Kubernetes substrates changes only the provisioning module —
+everything above the kubeconfig (Flux, gateway, TLS, secrets, apps) is identical.
+
+**That seam is what `docker-host` does not have.** A bare box running docker compose terminates
+in no kubeconfig at all, so it shares none of the configure layer: no Flux, no Forgejo, no
+gateway, no cert-manager. It reaches the same *outcome* — declared state in git, converged onto
+a machine, secrets delivered from a store — by a different mechanism, a per-box reconcile loop
+described in `backends/docker/README.md`.
+
+The two substrates therefore share a **contract**, not a flow. What crosses between them is the
+portable application definition: one `Application` renders to Kubernetes objects on one side and
+a compose file on the other, and a conformance test fails the build if either renderer stops
+honouring a field. Gitops content itself does not cross — kustomizations and HelmReleases mean
+nothing to a compose host — so moving an environment between them is a migration rather than a
+change to one line.
 
 ## In-cluster git as the source of truth
 
@@ -59,4 +72,6 @@ misleading "ready".
 |------|------|
 | 0 | Local — kind / k3d / minikube, self-contained, self-signed TLS. **Available now.** |
 | 1 | Cloud — AWS Fargate EKS, real DNS (external-dns) + ACME TLS via Route53, a load-balancer gateway. **Available now** (`substrate: eks`). |
+| 1 | Cloud — Scaleway Kapsule. **Available now** (`substrate: scaleway-kapsule`). |
+| 1 | Bare OS — a box with Docker and no Kubernetes, converged by a per-box gitops loop. **Available now** (`substrate: docker-host`). |
 | 2 | Multi-cluster, shared-services git hub, PR-driven applies. *Roadmap.* |

@@ -35,10 +35,69 @@ on the roadmap):
 | Field | Meaning |
 |-------|---------|
 | `name` | The environment's identity — also its cluster name and the `${environment}` substitution. |
-| `substrate` | `kind` · `k3d` · `minikube` · `eks` (AWS Fargate) · `existing` (bring-your-own kubeconfig). `scaleway-kapsule` is on the roadmap. |
+| `substrate` | `kind` · `k3d` · `minikube` · `eks` (AWS Fargate) · `scaleway-kapsule` · `existing` (bring-your-own kubeconfig) · `docker-host` (a bare box running docker compose, no Kubernetes at all). |
 | `domain` | Optional per-env override of the shared `spec.domain`. |
 | `kubeconfig` | Required when `substrate: existing` — path to the cluster's kubeconfig. |
-| `substrateConfig` | Per-substrate settings. For `eks`: `region`, `k8sVersion`, `route53ZoneId`, and optionally `vpcId` + `privateSubnetIds` + `publicSubnetIds` to reuse an existing VPC. |
+| `substrateConfig` | Per-substrate settings — see the table below. |
+
+### `substrateConfig` by substrate
+
+| Substrate | Keys |
+|-----------|------|
+| `eks` | `region`, `k8sVersion`, `route53ZoneId`; optionally `vpcId` + `privateSubnetIds` + `publicSubnetIds` to reuse an existing VPC |
+| `scaleway-kapsule` | `region`, `zone` (must be inside the region), `k8sVersion`, `nodeType`, `nodeCount`, `autoscaling`, `maxNodeCount`, `privateNetworkId` |
+| `docker-host` | `boxName` (defaults to `hostname -s`), `appsDir`, `gitopsBranch` |
+| local substrates | none |
+
+## Without Kubernetes: `docker-host`
+
+`substrate: docker-host` runs on a plain box with Docker on it. A per-box loop
+pulls the gitops repository every minute and converges the host's
+`docker compose` stacks to it — the same idea Flux implements, without the
+cluster it needs to run in.
+
+What it does **not** share with the Kubernetes substrates is worth knowing
+before choosing it:
+
+- `spec.tls`, `spec.gateway`, `spec.observability` and `spec.useCases` drive the
+  Kubernetes reconcile layer and are not consumed here.
+- Gitops content is a different artifact format entirely: a compose host reads
+  `apps/<box>/<app>/docker-compose.yml`, not kustomizations and HelmReleases. One
+  repository cannot serve both, so moving an environment across is a migration
+  rather than a change to one line.
+- `kubeconfig` and `diagram` are meaningless on it.
+- `down` inverts: it stops the reconcile loop and **leaves the stacks running**.
+  Decommissioning is a deliberate act, not a side effect of turning off the thing
+  that deploys.
+
+What *is* portable is the application definition — see below.
+
+## Portable applications
+
+An application can be written once and rendered for whichever substrate it lands
+on:
+
+```bash
+dabba application example > app.yaml
+dabba application render app.yaml --substrate kind          # Kubernetes objects
+dabba application render app.yaml --substrate docker-host   # a compose file
+```
+
+The shared schema is the **intersection** of what both runtimes genuinely
+honour, not the union: image, tag, ports, environment (literal or from the secret
+store), volumes, health check, resource limits. A field that cannot render
+meaningfully on both sides is not in the schema, and a conformance test fails the
+build if either renderer stops honouring one.
+
+Genuinely substrate-specific configuration goes in explicit `kubernetes:` and
+`dockerHost:` blocks. `dabba application portability <file> --substrate <s>`
+reports which of them a target will ignore rather than dropping them silently.
+
+Permanently out of scope, because no compose equivalent exists: autoscaling,
+NetworkPolicy, PodDisruptionBudgets, multi-node scheduling, service mesh. Also
+`replicas` and `dependsOn`, which look portable and are not — compose cannot
+scale a service publishing a fixed host port, and Kubernetes has no ordering
+primitive. These are rejected rather than ignored.
 
 ## Bring your own cluster
 

@@ -71,7 +71,7 @@ dabba config show [file]       # print the parsed, validated config
 
 | Layer | Component |
 |-------|-----------|
-| Provisioning | OpenTofu — kind / k3d / minikube (cloud substrates on the roadmap) |
+| Provisioning | OpenTofu — kind / k3d / minikube / EKS Fargate / Scaleway Kapsule; or no cluster at all with `docker-host` |
 | GitOps | FluxCD via the [Flux Operator](https://github.com/controlplaneio-fluxcd/flux-operator), syncing from an in-cluster [Forgejo](https://forgejo.org/) |
 | Gateway | Envoy Gateway (Gateway API) |
 | TLS | cert-manager (self-signed CA locally; ACME in the cloud) |
