@@ -19,7 +19,38 @@ pub fn env_workdir(config: &Path, env_name: &str) -> Result<PathBuf> {
         .unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join(".dabba").join(env_name);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+
     Ok(dir)
+}
+
+/// Write a secret to disk so it is never readable by anyone else, not even briefly.
+///
+/// `std::fs::write` creates the file with the process umask — 0644 on most hosts —
+/// and a `set_permissions` afterwards closes it only after the fact. Between the
+/// two, OpenBao's root token sits world-readable. The mode has to be applied at
+/// creation; the `set_permissions` that follows is for the case where the file
+/// already existed with a looser mode.
+fn write_secret_file(path: &Path, value: &str) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .with_context(|| format!("writing {}", path.display()))?;
+        file.write_all(value.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting permissions on {}", path.display()))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::write(path, value).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
 }
 
 /// Read-or-generate a per-env secret stashed in the workdir (0600). Reused across
@@ -39,12 +70,7 @@ pub fn env_secret(workdir: &Path, name: &str, complex: bool) -> Result<String> {
     } else {
         random_token(24)?
     };
-    std::fs::write(&path, &val).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
+    write_secret_file(&path, &val)?;
     Ok(val)
 }
 
@@ -55,13 +81,7 @@ pub fn env_secret(workdir: &Path, name: &str, complex: bool) -> Result<String> {
 /// cannot be recovered afterwards and cannot live inside the vault they open.
 pub fn write_stash(workdir: &Path, name: &str, value: &str) -> Result<()> {
     let path = workdir.join(name);
-    std::fs::write(&path, value).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("restricting permissions on {}", path.display()))?;
-    }
+    write_secret_file(&path, value)?;
     Ok(())
 }
 
@@ -184,5 +204,58 @@ pub mod scratch {
         fn drop(&mut self) {
             std::fs::remove_dir_all(&self.0).ok();
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::backend::common::scratch::ScratchDirectory;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &Path) -> u32 {
+        std::fs::metadata(path)
+            .expect("the file exists")
+            .permissions()
+            .mode()
+            & 0o777
+    }
+
+    /// OpenBao's root token and unseal key go through here. A `write` followed by a
+    /// `set_permissions` leaves them world-readable in between, so the mode has to
+    /// be applied at creation.
+    #[test]
+    fn a_secret_file_is_never_readable_by_anyone_else() {
+        let guard = ScratchDirectory::new("common-secret-mode");
+        let path = guard.path().join("token");
+
+        write_secret_file(&path, "s3cr3t").unwrap();
+        assert_eq!(mode_of(&path), 0o600, "a fresh secret file must be 0600");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "s3cr3t");
+
+        // A file that already exists with a loose mode must be tightened too — the
+        // creation mode does not apply to an existing file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        write_secret_file(&path, "rotated").unwrap();
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "an existing secret file must be tightened"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "rotated");
+    }
+
+    /// Both callers must go through it, or the guarantee is only half true.
+    #[test]
+    fn both_secret_writers_produce_a_restricted_file() {
+        let guard = ScratchDirectory::new("common-secret-writers");
+        let workdir = guard.path();
+
+        let generated = env_secret(workdir, "generated", false).unwrap();
+        assert!(!generated.is_empty());
+        assert_eq!(mode_of(&workdir.join("generated")), 0o600);
+
+        write_stash(workdir, "stashed", "given-value").unwrap();
+        assert_eq!(mode_of(&workdir.join("stashed")), 0o600);
     }
 }

@@ -38,6 +38,7 @@ use crate::backend::reconciler_assets::{self, REQUIRED_SCRIPTS};
 use crate::backend::{Backend, DownOptions, Options};
 use crate::config::{DabbaConfig, ResolvedEnv};
 use crate::run;
+use crate::run::shell_quote;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -172,6 +173,18 @@ fn valid_key_value_path(path: &str) -> bool {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         })
+}
+
+/// A secret FIELD name, checked against the same charset as a path segment.
+fn field_name(name: &str) -> Result<&str> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        bail!("secret field name {name:?} is not a plain name");
+    }
+    Ok(name)
 }
 
 fn openbao_token(workdir: &Path, env_name: &str) -> Result<String> {
@@ -524,12 +537,20 @@ pub fn ensure_secret_fields(
     let workdir = env_workdir(config, &env.name)?;
     let token = openbao_token(&workdir, &env.name)?;
 
-    let mut pairs: Vec<String> = existing
-        .iter()
-        .filter_map(|(k, v)| Some(format!("{}='{}'", k.as_str()?, v.as_str()?)))
-        .collect();
+    // Every field already at this path is rewritten alongside the new ones, and
+    // those values come back out of OpenBao rather than from here. A value holding
+    // an apostrophe would end the single quoting early — at best `bao kv put`
+    // fails, at worst the remainder is read as shell. Field names get the same
+    // charset rule as a path segment for the same reason.
+    let mut pairs: Vec<String> = Vec::new();
+    for (key, value) in existing.iter() {
+        let (Some(key), Some(value)) = (key.as_str(), value.as_str()) else {
+            continue;
+        };
+        pairs.push(format!("{}={}", field_name(key)?, shell_quote(value)));
+    }
     for (key, value) in &to_write {
-        pairs.push(format!("{key}='{value}'"));
+        pairs.push(format!("{}={}", field_name(key)?, shell_quote(value)));
     }
     openbao(
         &token,
@@ -1254,6 +1275,36 @@ mod tests {
             error.contains("does not look like backends/docker/"),
             "got: {error}"
         );
+    }
+
+    /// A secret value that already lives in OpenBao is rewritten verbatim whenever a
+    /// sibling field is added, so it reaches a shell command. Single quoting alone
+    /// does not survive an apostrophe: the quoting ends early and the remainder is
+    /// read as shell.
+    #[test]
+    fn a_secret_value_containing_a_quote_cannot_break_out_of_the_command() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+
+        let hostile = "x'; bao kv delete secret/everything; echo '";
+        let quoted = shell_quote(hostile);
+
+        // A substring check would be the wrong test here: correct quoting still
+        // CONTAINS the dangerous text, safely inside the quotes. The only honest
+        // check is to run it. The argument the command sees must be the original
+        // value byte for byte, which it cannot be if anything else executed.
+        let script = format!("printf '%s' {quoted}");
+        let seen = crate::run::capture("sh", &["-c", &script]).expect("the shell ran");
+        assert_eq!(seen, hostile, "quoting changed the value");
+    }
+
+    #[test]
+    fn a_field_name_must_be_a_plain_name() {
+        assert!(field_name("root-password").is_ok());
+        assert!(field_name("readwrite.access_key").is_ok());
+        for bad in ["", "a b", "a;b", "a/b", "a'b", "a$b"] {
+            assert!(field_name(bad).is_err(), "{bad:?} should be rejected");
+        }
     }
 
     /// The path is interpolated into a shell command inside the container, so a

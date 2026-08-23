@@ -123,7 +123,7 @@ pub fn render(app: &Application) -> Result<String> {
     // The dockerHost escape hatch is merged last so it can override anything
     // above, deeply, for the same reason the Kubernetes side does.
     let service = match &app.spec.docker_host {
-        Some(escape) => crate::render::deep_merge(Value::Mapping(service), escape.clone()),
+        Some(escape) => crate::render::deep_merge(Value::Mapping(service), escape.clone())?,
         None => Value::Mapping(service),
     };
     let service = match service {
@@ -200,8 +200,16 @@ fn health_command(app: &Application, health: &HealthCheck) -> Result<String> {
         ));
     }
 
-    // An exec probe runs in the container, exactly as Kubernetes runs one.
-    let command = health.exec.join(" ");
+    // An exec probe runs in the container, exactly as Kubernetes runs one. Each
+    // element is quoted: Kubernetes passes the list to exec directly, so no shell
+    // sees it there, while here it is spliced into a command string the reconciler
+    // runs with `bash -c`. Joining them raw made a probe argument executable.
+    let command = health
+        .exec
+        .iter()
+        .map(|argument| crate::run::shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ");
     Ok(format!(
         "docker compose -p {project} exec -T {service} {command} >/dev/null 2>&1"
     ))
@@ -312,6 +320,33 @@ mod tests {
         assert!(text.contains("http://conformance:9898/healthz"));
     }
 
+    /// Kubernetes hands an exec probe's list straight to `exec`, so no shell sees
+    /// it. Compose splices it into a string the reconciler runs with `bash -c`, so
+    /// every element has to be quoted or a probe ARGUMENT becomes a command.
+    #[test]
+    fn every_exec_probe_argument_is_quoted() {
+        let source = EXHAUSTIVE_EXAMPLE.replace(
+            "    httpGet:\n      path: /healthz\n      port: http",
+            "    exec: [\"sh\", \"-c\", \"true; touch /tmp/pwned\"]",
+        );
+        assert_ne!(source, EXHAUSTIVE_EXAMPLE, "the fixture anchor moved");
+        let app = Application::parse(&source).unwrap();
+        let text = render(&app).unwrap();
+
+        let command = text
+            .lines()
+            .find_map(|line| line.strip_prefix("x-health-cmd: "))
+            .expect("a health command was emitted");
+        assert!(
+            command.contains("'true; touch /tmp/pwned'"),
+            "the probe argument reached the command unquoted: {command}"
+        );
+        assert!(
+            !command.contains("conformance true;"),
+            "an unquoted argument would run as its own command: {command}"
+        );
+    }
+
     #[test]
     fn renders_an_exec_probe_as_a_compose_exec() {
         let source = EXHAUSTIVE_EXAMPLE.replace(
@@ -320,7 +355,9 @@ mod tests {
         );
         let app = Application::parse(&source).unwrap();
         let text = render(&app).unwrap();
-        assert!(text.contains("docker compose -p gitops-conformance exec -T conformance /bin/true"));
+        assert!(
+            text.contains("docker compose -p gitops-conformance exec -T conformance '/bin/true'")
+        );
     }
 
     #[test]

@@ -171,32 +171,59 @@ fn cache_container() -> Result<String> {
     Ok(id)
 }
 
-/// Run an `mc` script against the cache, with credentials passed through the
-/// environment rather than argv.
+/// Run an `mc` script against the cache with every secret on stdin.
 ///
-/// `MC_HOST_cache` is how the client takes an alias and its credentials in one
-/// variable; the alternative is `mc alias set`, which puts the secret key on a
-/// command line that every process on the box can read.
+/// Nothing sensitive may appear in what we hand to `docker`. `--env
+/// MC_HOST_cache=http://user:password@...` looks like "passed through the
+/// environment", but the value reaches the child by way of the docker CLI's own
+/// argv, which `ps` and `/proc` expose to every process on the box for as long as
+/// the command runs. The scoped secret keys had the same problem: they are written
+/// into `script`, which was passed as `sh -c <script>`.
+///
+/// So both travel on stdin instead, the way `reconcile.sh` feeds OpenBao its
+/// token. The outer `sh -c` reads the first line as the credential and then
+/// `exec sh -s` reads the rest of the stream as the script — the argv holds only
+/// that fixed six-word program.
+const CLIENT_PROGRAM: &str = "read -r MC_HOST_cache; export MC_HOST_cache; exec sh -s";
+
+/// Everything the call hands to docker: the argv, and the stdin payload.
+///
+/// Both come from here so a test can assert on exactly what `client` sends. Split
+/// across two helpers, a guard could check the argv builder while `client` quietly
+/// passed something else — which is a test that reports safety it never verified.
+fn client_invocation(
+    network: &str,
+    root_user: &str,
+    root_password: &str,
+    script: &str,
+) -> (Vec<String>, String) {
+    let arguments = [
+        "run",
+        "--rm",
+        "--interactive",
+        "--network",
+        network,
+        "--entrypoint",
+        "sh",
+        CLIENT_IMAGE,
+        "-c",
+        CLIENT_PROGRAM,
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+    // The first line is the VALUE only: `read -r MC_HOST_cache` assigns the whole
+    // line, so a "NAME=value" line would set the variable to "NAME=value".
+    let payload = format!("http://{root_user}:{root_password}@cache:9000\n{script}");
+    (arguments, payload)
+}
+
 fn client(root_user: &str, root_password: &str, script: &str) -> Result<String> {
     let network = format!("{CACHE_PROJECT}_default");
-    let host = format!("MC_HOST_cache=http://{root_user}:{root_password}@cache:9000");
-    run::capture(
-        "docker",
-        &[
-            "run",
-            "--rm",
-            "--network",
-            &network,
-            "--env",
-            &host,
-            "--entrypoint",
-            "sh",
-            CLIENT_IMAGE,
-            "-c",
-            script,
-        ],
-    )
-    .with_context(|| "running the object-store client".to_string())
+    let (arguments, payload) = client_invocation(&network, root_user, root_password, script);
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    run::capture_stdin("docker", &arguments, &payload)
+        .with_context(|| "running the object-store client".to_string())
 }
 
 /// Read a single field out of OpenBao for this environment.
@@ -376,5 +403,48 @@ mod tests {
         assert_ne!(rw.policy(), ro.policy());
         assert_ne!(rw.access_key(), ro.access_key());
         assert_ne!(rw.secret_key(), ro.secret_key());
+    }
+
+    /// Nothing secret may reach the docker command line. `ps` and `/proc` expose
+    /// argv to every process on the box, so a credential there is a credential
+    /// published to every user on the host for the length of the call — which is
+    /// exactly what `--env MC_HOST_cache=http://user:password@...` and
+    /// `sh -c <script containing the scoped keys>` used to do.
+    #[test]
+    fn no_credential_reaches_the_docker_command_line() {
+        const ROOT_USER: &str = "root-user-sentinel";
+        const ROOT_PASSWORD: &str = "root-password-sentinel";
+        const SCOPED_KEY: &str = "scoped-secret-key-sentinel";
+
+        let script = format!("mc admin user add cache 'access' '{SCOPED_KEY}'\n");
+        let (argv, payload) =
+            client_invocation("gitops-cache_default", ROOT_USER, ROOT_PASSWORD, &script);
+        let arguments = argv.join(" ");
+
+        for secret in [ROOT_USER, ROOT_PASSWORD, SCOPED_KEY] {
+            assert!(
+                !arguments.contains(secret),
+                "{secret} appears in the docker argv: {arguments}"
+            );
+            assert!(
+                payload.contains(secret),
+                "{secret} reached neither argv nor stdin, so the client cannot work"
+            );
+        }
+
+        // The program in argv must actually consume that first line, or the
+        // credential is simply lost rather than protected.
+        assert!(
+            CLIENT_PROGRAM.starts_with("read -r MC_HOST_cache"),
+            "the argv program no longer reads the credential from stdin"
+        );
+        // ...and the first stdin line must be the VALUE alone. `read -r NAME`
+        // assigns the whole line, so a "NAME=value" line sets the variable to
+        // "NAME=value" and every mc call authenticates as nobody.
+        let first = payload.lines().next().unwrap();
+        assert!(
+            first.starts_with("http://") && first.contains(ROOT_PASSWORD),
+            "the first stdin line must be the bare credential value, got: {first}"
+        );
     }
 }

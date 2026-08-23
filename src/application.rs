@@ -46,6 +46,16 @@
 //! * `dependsOn` — compose has `depends_on`; Kubernetes has no ordering primitive,
 //!   and faking one with init containers would mean the same field meant two
 //!   materially different things.
+//! * a LIVENESS probe, as distinct from the readiness one `healthCheck` provides.
+//!   Kubernetes has both and they mean different things: readiness answers "is
+//!   this working", liveness answers "restart it if this fails". A compose host
+//!   has no native equivalent of the second — Docker's own healthcheck marks a
+//!   container unhealthy and does not restart it, and `restart:` reacts to the
+//!   process exiting rather than to a probe. Putting liveness in the schema would
+//!   mean a field that restarts containers on one substrate and does nothing on
+//!   the other, which is worse than not having it. `healthCheck` is deliberately
+//!   readiness, and applications that need a distinct liveness probe declare it in
+//!   the `kubernetes:` escape hatch, where it is visibly non-portable.
 //! * `restartPolicy` — this one was in the schema until the Kubernetes renderer was
 //!   written, which is the intersection rule doing its job. A Deployment's pod
 //!   template accepts only `Always`; `OnFailure` and `Never` are valid solely for
@@ -149,9 +159,16 @@ pub struct EnvironmentVariable {
     /// A literal value. Mutually exclusive with `secret`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
-    /// Resolved from the secret store at deploy time: an ExternalSecret-backed
-    /// Secret on Kubernetes, and the box-local `.env` the reconciler already reads
-    /// on a compose host, populated from OpenBao.
+    /// Resolved from the secret store at deploy time, by a different mechanism on
+    /// each substrate, and self-contained on both.
+    ///
+    /// On a compose host the reconciler reads the reference out of the rendered file,
+    /// resolves it from OpenBao, and writes it into the stack `.env` every tick.
+    ///
+    /// On Kubernetes the renderer emits a `secretKeyRef` AND the ExternalSecret that
+    /// satisfies it, so External Secrets populates the Secret from the same OpenBao
+    /// path. Declaring the field is all either substrate needs; emitting only the
+    /// reference left the pod in CreateContainerConfigError.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<SecretReference>,
 }
@@ -214,6 +231,53 @@ fn default_period() -> u32 {
     10
 }
 
+/// The Kubernetes Secret an application's reference resolves through.
+///
+/// `secret.name` is a path in the store and may be nested — `dabba/openobserve` is
+/// a real one. A Kubernetes object name may not contain `/`, so the separators
+/// become dashes here while `remoteRef.key` keeps the real path. Two different
+/// paths could in principle collapse to the same object name; `validate` rejects
+/// that rather than letting one silently shadow the other.
+///
+/// It lives beside the schema rather than in the renderer so that the name the
+/// `secretKeyRef` asks for and the name the ExternalSecret provides cannot drift.
+pub fn secret_object_name(application: &str, secret: &str) -> String {
+    format!("{application}-{}", secret.replace('/', "-"))
+}
+/// A DNS-1123 label: lowercase alphanumerics and `-`, starting and ending
+/// alphanumeric, at most 63 characters.
+///
+/// This is what Kubernetes requires of a Deployment, Service or claim name, so the
+/// schema would fail at apply on anything else anyway. It matters earlier than that
+/// on a compose host: the application name is interpolated into the `x-health-cmd`
+/// the reconciler runs with `bash -c`, so a name carrying shell metacharacters
+/// executes on the box every tick. Rejecting it here is the same choice
+/// `valid_key_value_path` makes for secret paths — refuse the name rather than
+/// escape it downstream.
+fn valid_dns_label(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 63
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+        && name.ends_with(|c: char| c.is_ascii_alphanumeric())
+}
+
+/// An HTTP probe path. It is interpolated into that same shell command, so it is
+/// checked rather than escaped: a probe path is a URL path and has no business
+/// containing whitespace or shell syntax.
+fn valid_probe_path(path: &str) -> bool {
+    path.starts_with('/')
+        && path.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '/' | '-' | '_' | '.' | '~' | '%' | '=' | '&' | '?' | '+' | ':'
+                )
+        })
+}
+
 impl Application {
     /// Parse and validate.
     pub fn parse(text: &str) -> Result<Self> {
@@ -235,6 +299,15 @@ impl Application {
         if self.metadata.name.trim().is_empty() {
             bail!("metadata.name is required");
         }
+        if !valid_dns_label(&self.metadata.name) {
+            bail!(
+                "metadata.name {:?} must be a DNS-1123 label (lowercase letters, digits \
+                 and dashes, starting and ending alphanumeric). It names a Deployment \
+                 and a Service, and it is interpolated into the health command the \
+                 compose reconciler runs.",
+                self.metadata.name
+            );
+        }
         if self.spec.image.trim().is_empty() {
             bail!("spec.image is required");
         }
@@ -246,6 +319,13 @@ impl Application {
         for port in &self.spec.ports {
             if !seen_ports.insert(port.name.as_str()) {
                 bail!("duplicate port name {:?}", port.name);
+            }
+            if !valid_dns_label(&port.name) {
+                bail!(
+                    "port name {:?} must be a DNS-1123 label; it becomes a Service \
+                     targetPort",
+                    port.name
+                );
             }
         }
 
@@ -275,14 +355,65 @@ impl Application {
                         get.port
                     );
                 }
+                (Some(get), true) if !valid_probe_path(&get.path) => {
+                    bail!(
+                        "healthCheck.httpGet.path {:?} is not a plain URL path. It is \
+                         interpolated into the health command the compose reconciler \
+                         runs, so it may not carry whitespace or shell syntax.",
+                        get.path
+                    );
+                }
                 _ => {}
             }
+        }
+        // A secret reference names a Kubernetes Secret as well as a path in the
+        // store, and those have different rules. Checking it here means a nested
+        // path that cannot become an object name fails at `validate`, rather than
+        // rendering an object the API server rejects for a reason that says
+        // nothing about the definition that produced it.
+        let mut object_names: Vec<(String, String)> = Vec::new();
+        for variable in &self.spec.environment {
+            let Some(secret) = &variable.secret else {
+                continue;
+            };
+            let object = secret_object_name(&self.metadata.name, &secret.name);
+            if !valid_dns_label(&object) {
+                bail!(
+                    "environment variable {:?} references secret {:?}, which becomes the \
+                     Kubernetes Secret name {object:?} — not a DNS-1123 label. A store \
+                     path may nest with '/', but every segment still has to be lowercase \
+                     letters, digits and dashes.",
+                    variable.name,
+                    secret.name
+                );
+            }
+            // Same object name from a DIFFERENT path is the collision. The same
+            // path twice is just two variables reading two keys of one secret,
+            // which is normal and groups into one ExternalSecret.
+            if let Some((other, _)) = object_names
+                .iter()
+                .find(|(path, name)| name == &object && path != &secret.name)
+            {
+                bail!(
+                    "secrets {:?} and {other:?} both become the Kubernetes Secret name \
+                     {object:?}; one would silently shadow the other. Rename one.",
+                    secret.name
+                );
+            }
+            object_names.push((secret.name.clone(), object));
         }
 
         let mut seen_volumes = std::collections::HashSet::new();
         for volume in &self.spec.volumes {
             if !seen_volumes.insert(volume.name.as_str()) {
                 bail!("duplicate volume name {:?}", volume.name);
+            }
+            if !valid_dns_label(&volume.name) {
+                bail!(
+                    "volume name {:?} must be a DNS-1123 label; it names a claim and a \
+                     bind-mount directory",
+                    volume.name
+                );
             }
             if !volume.mount_path.starts_with('/') {
                 bail!(
@@ -364,6 +495,102 @@ spec:
 mod tests {
     use super::*;
 
+    /// `metadata.name` and `healthCheck.httpGet.path` are interpolated into the
+    /// `x-health-cmd` string that the compose reconciler runs with `bash -c`, every
+    /// tick. Both are also Kubernetes object names or URL paths, so nothing
+    /// legitimate is lost by requiring them to look like one.
+    #[test]
+    fn a_name_that_would_become_shell_is_rejected() {
+        let hostile = EXHAUSTIVE_EXAMPLE.replace(
+            "  name: conformance",
+            "  name: \"app; touch /tmp/pwned; echo\"",
+        );
+        assert_ne!(hostile, EXHAUSTIVE_EXAMPLE, "the fixture anchor moved");
+        let error = Application::parse(&hostile).expect_err("a shell name must be rejected");
+        assert!(
+            error.to_string().contains("DNS-1123"),
+            "unexpected error: {error}"
+        );
+
+        for bad in ["Uppercase", "trailing-", "-leading", "has space", "a/b", ""] {
+            assert!(!valid_dns_label(bad), "{bad:?} should be rejected");
+        }
+        for good in ["conformance", "cache", "a", "a-b-c", "app123"] {
+            assert!(valid_dns_label(good), "{good:?} should be accepted");
+        }
+    }
+
+    /// A store path may nest — `dabba/openobserve` is one the platform actually
+    /// uses — but a Kubernetes object name may not contain `/`. Emitting the path
+    /// straight into the Secret name produced `openobserve-dabba/openobserve`,
+    /// which the API server rejects for a reason that says nothing about the
+    /// definition that caused it.
+    #[test]
+    fn a_nested_secret_path_becomes_a_valid_object_name() {
+        assert_eq!(
+            secret_object_name("openobserve", "dabba/openobserve"),
+            "openobserve-dabba-openobserve"
+        );
+        assert!(valid_dns_label(&secret_object_name(
+            "openobserve",
+            "dabba/openobserve"
+        )));
+
+        let nested = EXHAUSTIVE_EXAMPLE.replace("        name: demo", "        name: team/demo");
+        assert_ne!(nested, EXHAUSTIVE_EXAMPLE, "the fixture anchor moved");
+        Application::parse(&nested).expect("a nested path is legitimate and must parse");
+    }
+
+    /// The sanitising is not allowed to turn two different secrets into one object,
+    /// because the second would silently shadow the first.
+    #[test]
+    fn two_secrets_that_would_share_an_object_name_are_rejected() {
+        let source = EXHAUSTIVE_EXAMPLE.replace(
+            "    - name: SECRET_SETTING\n      secret:\n        name: demo\n        key: message",
+            "    - name: FIRST\n      secret:\n        name: team/demo\n        key: message\n    \
+             - name: SECOND\n      secret:\n        name: team-demo\n        key: message",
+        );
+        assert_ne!(source, EXHAUSTIVE_EXAMPLE, "the fixture anchor moved");
+        let error = Application::parse(&source).expect_err("a collision must be rejected");
+        assert!(
+            error.to_string().contains("silently shadow"),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// And a path segment that cannot be part of an object name at all fails at
+    /// validate rather than at apply.
+    #[test]
+    fn a_secret_path_that_cannot_become_an_object_name_is_rejected() {
+        let source = EXHAUSTIVE_EXAMPLE.replace("        name: demo", "        name: Team_Demo");
+        assert_ne!(source, EXHAUSTIVE_EXAMPLE, "the fixture anchor moved");
+        let error = Application::parse(&source).expect_err("an unusable path must be rejected");
+        assert!(
+            error.to_string().contains("DNS-1123"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_probe_path_that_would_become_shell_is_rejected() {
+        let hostile = EXHAUSTIVE_EXAMPLE.replace(
+            "      path: /healthz",
+            "      path: \"/healthz; touch /tmp/pwned\"",
+        );
+        assert_ne!(hostile, EXHAUSTIVE_EXAMPLE, "the fixture anchor moved");
+        let error = Application::parse(&hostile).expect_err("a shell path must be rejected");
+        assert!(
+            error.to_string().contains("plain URL path"),
+            "unexpected error: {error}"
+        );
+
+        assert!(valid_probe_path("/healthz"));
+        assert!(valid_probe_path("/v1/health?full=1"));
+        assert!(!valid_probe_path("healthz"), "must be absolute");
+        assert!(!valid_probe_path("/a b"));
+        assert!(!valid_probe_path("/a$(id)"));
+        assert!(!valid_probe_path("/a`id`"));
+    }
     fn exhaustive() -> Application {
         Application::parse(EXHAUSTIVE_EXAMPLE).expect("the exhaustive example must be valid")
     }

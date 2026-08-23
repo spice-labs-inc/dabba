@@ -8,7 +8,7 @@
 #     dabba application render examples/applications/cache-minio.yaml \
 #       --substrate docker-host        # a compose stack on a box
 #     dabba application render examples/applications/cache-minio.yaml \
-#       --substrate scaleway-kapsule   # a Deployment, Service and claim
+#       --substrate scaleway-kapsule   # a Deployment, Service, claim and ExternalSecret
 #
 # WHERE THIS SHOULD RUN, and why it is not a matter of taste: a cache is only
 # worth operating if it outlives the thing using it. Started on an ephemeral CI

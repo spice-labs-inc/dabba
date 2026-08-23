@@ -332,6 +332,74 @@ mod tests {
         assert!(!kubernetes_output.contains("compose-only"));
     }
 
+    /// A `secretKeyRef` is a promise that some Secret exists with that name and key.
+    /// Emitting the reference without the object that satisfies it is not a rendered
+    /// application, it is a pod that will never start — and the matrix above cannot
+    /// see the difference, because both cases contain the string `secretKeyRef`.
+    ///
+    /// So this walks the actual objects: every reference the Deployment makes must be
+    /// matched by an ExternalSecret this same render emitted, by target name AND by
+    /// key. That is the Kubernetes half of what the reconciler does on a compose host
+    /// when it resolves `x-secrets` into the stack `.env`.
+    #[test]
+    fn every_secret_reference_is_satisfied_by_an_emitted_external_secret() {
+        let app = Application::parse(EXHAUSTIVE_EXAMPLE).unwrap();
+        let rendered = kubernetes::render(&app).unwrap();
+        let documents: Vec<serde_yaml::Value> = serde_yaml::Deserializer::from_str(&rendered)
+            .map(|d| serde::Deserialize::deserialize(d).unwrap())
+            .filter(|v: &serde_yaml::Value| !v.is_null())
+            .collect();
+
+        // What each emitted ExternalSecret provides: target name -> the keys it fills.
+        let provided: Vec<(String, Vec<String>)> = documents
+            .iter()
+            .filter(|d| d.get("kind").and_then(|k| k.as_str()) == Some("ExternalSecret"))
+            .map(|d| {
+                let target = d["spec"]["target"]["name"].as_str().unwrap().to_string();
+                let keys = d["spec"]["data"]
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .map(|entry| entry["secretKey"].as_str().unwrap().to_string())
+                    .collect();
+                (target, keys)
+            })
+            .collect();
+
+        // What the container asks for.
+        let deployment = documents
+            .iter()
+            .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Deployment"))
+            .expect("a Deployment was rendered");
+        let container = &deployment["spec"]["template"]["spec"]["containers"][0];
+        let mut references = 0;
+        for variable in container["env"].as_sequence().expect("env was rendered") {
+            let Some(key_ref) = variable
+                .get("valueFrom")
+                .and_then(|v| v.get("secretKeyRef"))
+            else {
+                continue;
+            };
+            let wanted_secret = key_ref["name"].as_str().unwrap();
+            let wanted_key = key_ref["key"].as_str().unwrap();
+            let satisfied = provided.iter().any(|(target, keys)| {
+                target == wanted_secret && keys.iter().any(|k| k == wanted_key)
+            });
+            assert!(
+                satisfied,
+                "the container reads {wanted_key:?} from Secret {wanted_secret:?}, which no \
+                 emitted ExternalSecret produces — the pod would stay in \
+                 CreateContainerConfigError. Emitted: {provided:?}"
+            );
+            references += 1;
+        }
+        assert!(
+            references > 0,
+            "the fixture declares a secret but the Deployment makes no secretKeyRef, so \
+             this test would pass vacuously"
+        );
+    }
+
     /// A secret's VALUE must never be rendered into either artifact — both go into
     /// a git repository. Only the indirection belongs there.
     #[test]

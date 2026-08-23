@@ -122,6 +122,24 @@ pub fn capture_including_failures(bin: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run with `input` on stdin and return stdout (None on spawn failure or non-zero
+/// exit). The stdin counterpart of [`capture`], for a command that needs a secret
+/// off the argv `ps` exposes and whose failure really is a failure.
+pub fn capture_stdin(bin: &str, args: &[&str], input: &str) -> Option<String> {
+    use std::io::Write;
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(input.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Run with `input` on stdin and return stdout regardless of exit status.
 ///
 /// The combination `capture` and `run_stdin` cannot express: a command that needs
@@ -160,4 +178,14 @@ pub fn wait_for<F: Fn() -> bool>(desc: &str, attempts: usize, probe: F) -> Resul
         sleep(Duration::from_secs(5));
     }
     bail!("timed out waiting for: {desc}")
+}
+
+/// A value quoted for a POSIX shell.
+///
+/// The interesting case is the apostrophe: single quoting cannot contain one, so the
+/// quoting is closed, an escaped quote emitted, and the quoting reopened. Anything
+/// that interpolates a value into a command string needs this — a secret out of the
+/// store, a health command out of a gitops repo.
+pub fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
 }

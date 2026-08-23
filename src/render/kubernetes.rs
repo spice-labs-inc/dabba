@@ -1,23 +1,27 @@
 //! Render an [`Application`] to the Kubernetes objects the Flux path consumes.
 //!
-//! A Deployment, a Service for any declared port, and a PersistentVolumeClaim per
-//! volume — emitted as a multi-document YAML stream, which is what a kustomization
-//! takes as a resource file.
+//! A Deployment, a Service for any declared port, a PersistentVolumeClaim per
+//! volume, and an ExternalSecret per referenced secret — emitted as a multi-document
+//! YAML stream, which is what a kustomization takes as a resource file.
 //!
 //! Two shapes here are dictated by the portability contract rather than by
 //! Kubernetes taste:
 //!
-//! * Secret-backed environment variables render as `secretKeyRef` against a Secret
-//!   named for the application. On this substrate External Secrets populates it from
-//!   OpenBao; on a compose host the same declaration resolves from the box-local
-//!   `.env`. One field, two mechanisms, same meaning.
+//! * Secret-backed environment variables render as a `secretKeyRef` AND the
+//!   ExternalSecret that satisfies it, so External Secrets populates the Secret from
+//!   the same OpenBao path the compose reconciler reads. Emitting only the reference
+//!   made the field self-contained on a compose host and half a feature here: the
+//!   Secret it named did not exist, and the pod never started. One field, two
+//!   mechanisms, same meaning.
 //! * The health check becomes a readiness probe, not a liveness probe. It is the
 //!   answer to "is this working", which is the same question the reconciler's
 //!   `x-health-cmd` gate answers on a compose host. Wiring it to liveness would make
 //!   a failing probe restart the container on one substrate and merely report on the
-//!   other.
+//!   other. An application that genuinely needs a liveness probe declares one in the
+//!   `kubernetes:` escape hatch, and the deep merge adds it to this container
+//!   without disturbing the readiness probe generated here.
 
-use crate::application::{Application, EnvironmentVariable, HealthCheck};
+use crate::application::{secret_object_name, Application, EnvironmentVariable, HealthCheck};
 use crate::render::string_map;
 use anyhow::Result;
 use serde_yaml::{Mapping, Value};
@@ -40,6 +44,7 @@ pub fn render(app: &Application) -> Result<String> {
     for volume in &app.spec.volumes {
         documents.push(persistent_volume_claim(app, &volume.name));
     }
+    documents.extend(external_secrets(app));
 
     let mut out = format!(
         "# Rendered by dabba from the portable Application definition for {name}.\n\
@@ -172,9 +177,99 @@ fn deployment(app: &Application) -> Result<Value> {
     // rejects. See `crate::render::deep_merge`.
     let rendered = Value::Mapping(deployment);
     Ok(match &app.spec.kubernetes {
-        Some(escape) => crate::render::deep_merge(rendered, escape.clone()),
+        Some(escape) => crate::render::deep_merge(rendered, escape.clone())?,
         None => rendered,
     })
+}
+
+/// The `ClusterSecretStore` that fronts OpenBao, defined by the platform layer in
+/// the gitops repository (`platform/components/openbao-dev`). Its provider is the
+/// vault one — OpenBao is API-compatible — mounted at `secret`, which is why a
+/// `remoteRef.key` here is the path WITHOUT that prefix, matching what the compose
+/// reconciler reads from `secret/<path>`.
+///
+/// This name is a coupling to another repository, and nothing in this build can
+/// check it. If the store is ever renamed there, every generated ExternalSecret
+/// stops resolving and the pods stall in `CreateContainerConfigError`.
+const SECRET_STORE: &str = "openbao";
+
+/// How often External Secrets re-reads the value, matching the hand-written
+/// ExternalSecrets already in the gitops repository. It is also what makes a
+/// rotation land without a redeploy, which is the same property the compose
+/// reconciler gets by rewriting the stack `.env` every tick.
+const SECRET_REFRESH_INTERVAL: &str = "10s";
+
+/// One ExternalSecret per distinct `secret.name` an application references.
+///
+/// Without these the Kubernetes half of `spec.environment[].secret` was only half a
+/// feature: the container got a `secretKeyRef` naming a Secret that nothing created,
+/// so the pod never started, while the same declaration on a compose host resolved
+/// end to end. Emitting them is what makes the field mean the same thing on both
+/// substrates.
+///
+/// References are grouped by secret name so that two variables reading two keys of
+/// one path produce one object with two entries, rather than two objects fighting
+/// over the same target Secret.
+fn external_secrets(app: &Application) -> Vec<Value> {
+    let name = &app.metadata.name;
+    // First-appearance order, so the rendered stream is stable across runs.
+    let mut order: Vec<&str> = Vec::new();
+    let mut keys_by_secret: Vec<(&str, Vec<&str>)> = Vec::new();
+    for variable in &app.spec.environment {
+        let Some(secret) = &variable.secret else {
+            continue;
+        };
+        match order.iter().position(|s| *s == secret.name) {
+            Some(index) => {
+                let keys = &mut keys_by_secret[index].1;
+                if !keys.contains(&secret.key.as_str()) {
+                    keys.push(&secret.key);
+                }
+            }
+            None => {
+                order.push(&secret.name);
+                keys_by_secret.push((&secret.name, vec![&secret.key]));
+            }
+        }
+    }
+
+    keys_by_secret
+        .into_iter()
+        .map(|(secret_name, keys)| {
+            let target = secret_object_name(name, secret_name);
+            let data: Vec<Value> = keys
+                .into_iter()
+                .map(|key| {
+                    map([
+                        ("secretKey", string(key)),
+                        (
+                            "remoteRef",
+                            map([("key", string(secret_name)), ("property", string(key))]),
+                        ),
+                    ])
+                })
+                .collect();
+
+            let mut spec = Mapping::new();
+            spec.insert(string("refreshInterval"), string(SECRET_REFRESH_INTERVAL));
+            spec.insert(
+                string("secretStoreRef"),
+                map([
+                    ("kind", string("ClusterSecretStore")),
+                    ("name", string(SECRET_STORE)),
+                ]),
+            );
+            spec.insert(string("target"), map([("name", string(target.clone()))]));
+            spec.insert(string("data"), Value::Sequence(data));
+
+            let mut object = Mapping::new();
+            object.insert(string("apiVersion"), string("external-secrets.io/v1"));
+            object.insert(string("kind"), string("ExternalSecret"));
+            object.insert(string("metadata"), map([("name", string(target))]));
+            object.insert(string("spec"), Value::Mapping(spec));
+            Value::Mapping(object)
+        })
+        .collect()
 }
 
 fn environment_variable(application: &str, variable: &EnvironmentVariable) -> Value {
@@ -193,7 +288,7 @@ fn environment_variable(application: &str, variable: &EnvironmentVariable) -> Va
             let mut key_ref = Mapping::new();
             key_ref.insert(
                 string("name"),
-                string(format!("{application}-{}", secret.name)),
+                string(secret_object_name(application, &secret.name)),
             );
             key_ref.insert(string("key"), string(secret.key.clone()));
             entry.insert(
@@ -319,10 +414,16 @@ mod tests {
     #[test]
     fn renders_a_deployment_service_and_claim() {
         let documents = documents();
-        assert_eq!(documents.len(), 3, "expected Deployment, Service, PVC");
+        assert_eq!(
+            documents.len(),
+            4,
+            "expected Deployment, Service, PVC and the ExternalSecret backing the \
+             fixture's secret reference"
+        );
         kind(&documents, "Deployment");
         kind(&documents, "Service");
         kind(&documents, "PersistentVolumeClaim");
+        kind(&documents, "ExternalSecret");
     }
 
     #[test]

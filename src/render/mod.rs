@@ -103,23 +103,50 @@ pub fn string_map<const N: usize>(pairs: [(&str, &str); N]) -> serde_yaml::Mappi
 ///    on `name`, and without it patching one field of one container means
 ///    restating the entire container.
 /// 3. Anything else: the overlay wins.
-pub fn deep_merge(base: serde_yaml::Value, overlay: serde_yaml::Value) -> serde_yaml::Value {
+pub fn deep_merge(
+    base: serde_yaml::Value,
+    overlay: serde_yaml::Value,
+) -> Result<serde_yaml::Value> {
+    merge_at(base, overlay, "")
+}
+
+/// `path` is the dotted location of the value being merged, carried only so a
+/// failure names where in the escape hatch the problem is rather than reporting
+/// that something, somewhere, was wrong.
+fn merge_at(
+    base: serde_yaml::Value,
+    overlay: serde_yaml::Value,
+    path: &str,
+) -> Result<serde_yaml::Value> {
     use serde_yaml::Value;
     match (base, overlay) {
         (Value::Mapping(mut base), Value::Mapping(overlay)) => {
             for (key, overlay_value) in overlay {
-                let merged = match base.remove(&key) {
-                    Some(base_value) => deep_merge(base_value, overlay_value),
-                    None => overlay_value,
+                let child = match key.as_str() {
+                    Some(name) if path.is_empty() => name.to_string(),
+                    Some(name) => format!("{path}.{name}"),
+                    None => path.to_string(),
                 };
-                base.insert(key, merged);
+                // Merge IN PLACE rather than remove-then-insert. Removing moved every
+                // merged key to the end, so patching one field of a container shuffled
+                // `name` and `image` below the patch — in a file people read and diff
+                // in a gitops repository. Only genuinely new keys are appended.
+                match base.get_mut(&key) {
+                    Some(slot) => {
+                        let existing = std::mem::take(slot);
+                        *slot = merge_at(existing, overlay_value, &child)?;
+                    }
+                    None => {
+                        base.insert(key, overlay_value);
+                    }
+                }
             }
-            Value::Mapping(base)
+            Ok(Value::Mapping(base))
         }
         (Value::Sequence(base), Value::Sequence(overlay)) if keyed_by_name(&base) => {
-            merge_sequence_by_name(base, overlay)
+            merge_sequence_by_name(base, overlay, path)
         }
-        (_, overlay) => overlay,
+        (_, overlay) => Ok(overlay),
     }
 }
 
@@ -136,27 +163,44 @@ fn keyed_by_name(items: &[serde_yaml::Value]) -> bool {
 fn merge_sequence_by_name(
     base: Vec<serde_yaml::Value>,
     overlay: Vec<serde_yaml::Value>,
-) -> serde_yaml::Value {
+    path: &str,
+) -> Result<serde_yaml::Value> {
     let name_of = |item: &serde_yaml::Value| {
         item.get("name")
             .and_then(|n| n.as_str())
             .map(str::to_string)
     };
+    let where_ = if path.is_empty() { "the overlay" } else { path };
     let mut merged = base;
-    for overlay_item in overlay {
-        match name_of(&overlay_item).and_then(|name| {
-            merged
-                .iter()
-                .position(|b| name_of(b).as_deref() == Some(&name))
-        }) {
+    for (position, overlay_item) in overlay.into_iter().enumerate() {
+        // The base list is keyed by name, so an overlay element without one cannot
+        // be matched against it. Appending it — which is what this used to do —
+        // turns a patch that forgot `name:` into a SECOND element: a second
+        // container rather than an edit to the first. Kubernetes then rejects the
+        // object for a reason that reads nothing like the mistake that caused it.
+        let Some(name) = name_of(&overlay_item) else {
+            bail!(
+                "{where_}[{position}] has no `name`, but the generated list is keyed \
+                 by name. Add the name of the element you meant to patch — without \
+                 it this would be appended as a new entry rather than merged into \
+                 the existing one."
+            );
+        };
+        match merged
+            .iter()
+            .position(|b| name_of(b).as_deref() == Some(&name))
+        {
             Some(index) => {
                 let existing = merged.remove(index);
-                merged.insert(index, deep_merge(existing, overlay_item));
+                merged.insert(
+                    index,
+                    merge_at(existing, overlay_item, &format!("{where_}.{name}"))?,
+                );
             }
             None => merged.push(overlay_item),
         }
     }
-    serde_yaml::Value::Sequence(merged)
+    Ok(serde_yaml::Value::Sequence(merged))
 }
 
 /// The compose project a stack runs under, matching the reconciler's convention.
@@ -204,7 +248,8 @@ mod tests {
         let merged = deep_merge(
             yaml("spec:\n  selector: {matchLabels: {app: x}}\n  replicas: 1\n  template: {a: 1}"),
             yaml("spec:\n  template: {b: 2}"),
-        );
+        )
+        .unwrap();
         assert!(merged["spec"]["selector"]["matchLabels"]["app"] == yaml("x"));
         assert_eq!(merged["spec"]["replicas"], yaml("1"));
         // The overlay merged into template rather than replacing it.
@@ -219,7 +264,8 @@ mod tests {
         let merged = deep_merge(
             yaml("containers:\n  - name: a\n    image: img\n    ports: [{name: p}]"),
             yaml("containers:\n  - name: a\n    args: [run]"),
-        );
+        )
+        .unwrap();
         let containers = merged["containers"].as_sequence().unwrap();
         assert_eq!(containers.len(), 1, "merged by name, not appended");
         assert_eq!(
@@ -236,7 +282,8 @@ mod tests {
         let merged = deep_merge(
             yaml("containers:\n  - name: a\n    image: one"),
             yaml("containers:\n  - name: sidecar\n    image: two"),
-        );
+        )
+        .unwrap();
         let containers = merged["containers"].as_sequence().unwrap();
         assert_eq!(containers.len(), 2);
         assert_eq!(containers[0]["image"], yaml("one"));
@@ -247,7 +294,7 @@ mod tests {
     /// and is the reason merging by name is gated on every element having one.
     #[test]
     fn scalar_sequences_replace_rather_than_merge() {
-        let merged = deep_merge(yaml("args: [a, b, c]"), yaml("args: [x]"));
+        let merged = deep_merge(yaml("args: [a, b, c]"), yaml("args: [x]")).unwrap();
         assert_eq!(merged["args"].as_sequence().unwrap().len(), 1);
         assert_eq!(merged["args"][0], yaml("x"));
     }
@@ -259,18 +306,76 @@ mod tests {
         let merged = deep_merge(
             yaml("items:\n  - name: a\n  - other: b"),
             yaml("items:\n  - name: c"),
-        );
+        )
+        .unwrap();
         assert_eq!(merged["items"].as_sequence().unwrap().len(), 1);
     }
 
     #[test]
     fn a_scalar_overlay_wins_over_a_mapping() {
-        let merged = deep_merge(yaml("restart: {a: 1}"), yaml("restart: never"));
+        let merged = deep_merge(yaml("restart: {a: 1}"), yaml("restart: never")).unwrap();
         assert_eq!(merged["restart"], yaml("never"));
+    }
+
+    /// Merging must not reorder the base. Remove-then-insert moved every merged key
+    /// to the end, so patching one field of a container pushed `name` and `image`
+    /// below the patch — in a file people read and diff in a gitops repository.
+    #[test]
+    fn merging_preserves_the_order_of_the_base() {
+        let merged = deep_merge(
+            // `resources` sits in the MIDDLE of the base on purpose. With it last,
+            // remove-then-insert puts it back where it was and the test proves
+            // nothing — which is what the first version of this did.
+            yaml("name: app\nimage: base\nresources: {limits: {cpu: 1}}\nports: [80]"),
+            yaml("resources: {requests: {cpu: 1}}\nargs: [serve]"),
+        )
+        .unwrap();
+        let keys: Vec<String> = merged
+            .as_mapping()
+            .unwrap()
+            .keys()
+            .map(|k| k.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["name", "image", "resources", "ports", "args"],
+            "the merged key kept its position and the new one was appended"
+        );
     }
 
     #[test]
     fn project_name_matches_the_reconciler_convention() {
         assert_eq!(project_name("podinfo"), "gitops-podinfo");
+    }
+
+    /// An overlay element with no `name` cannot be matched against a base list that
+    /// is keyed by name. Appending it — the old behaviour — turns a patch that
+    /// forgot `name:` into a second container, and the object is then rejected by
+    /// the API server for a reason that reads nothing like the actual mistake.
+    #[test]
+    fn an_unnamed_overlay_element_is_rejected_rather_than_appended() {
+        let error = deep_merge(
+            yaml("spec:\n  containers:\n    - name: app\n      image: base"),
+            yaml("spec:\n  containers:\n    - image: patched"),
+        )
+        .expect_err("an unnamed element must not merge silently");
+        let message = error.to_string();
+
+        assert!(
+            message.contains("spec.containers[0]"),
+            "the error must name where in the overlay the problem is, got: {message}"
+        );
+        assert!(
+            message.contains("no `name`"),
+            "the error must say what is missing, got: {message}"
+        );
+    }
+
+    /// The rejection must not fire on a list that is not keyed by name: `args` and
+    /// `command` are sequences of scalars and replace wholesale.
+    #[test]
+    fn a_scalar_sequence_overlay_is_still_allowed_to_replace() {
+        let merged = deep_merge(yaml("args: [a, b]"), yaml("args: [x]")).unwrap();
+        assert_eq!(merged["args"].as_sequence().unwrap().len(), 1);
     }
 }
