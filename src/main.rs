@@ -9,6 +9,7 @@
 //!   config: config validate | show
 //!   shell:  completions <shell>
 
+mod application;
 mod backend;
 mod config;
 mod edit;
@@ -88,6 +89,11 @@ enum Command {
     },
     /// Preflight checks (docker / tools / cluster reachable)
     Doctor,
+    /// Work with portable application definitions
+    Application {
+        #[command(subcommand)]
+        action: ApplicationAction,
+    },
     /// Manage the dabba config
     Config {
         #[command(subcommand)]
@@ -138,6 +144,25 @@ enum SecretAction {
 }
 
 #[derive(Subcommand)]
+enum ApplicationAction {
+    /// Validate an application definition against the portable schema
+    Validate {
+        /// Path to the Application YAML
+        file: PathBuf,
+    },
+    /// Print a starter definition exercising every portable field
+    Example,
+    /// Report which parts of a definition a given substrate will NOT honour
+    Portability {
+        /// Path to the Application YAML
+        file: PathBuf,
+        /// Substrate to check against (any Kubernetes substrate, or docker-host)
+        #[arg(long, default_value = "docker-host")]
+        substrate: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     /// Validate a config against the schema
     Validate {
@@ -171,6 +196,51 @@ fn main() -> Result<()> {
             }
         },
         Command::Doctor => doctor(&cfg),
+        Command::Application { action } => match action {
+            ApplicationAction::Validate { file } => {
+                let text = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let app = application::Application::parse(&text)?;
+                println!(
+                    "✓ {} is a valid portable application definition",
+                    app.metadata.name
+                );
+                Ok(())
+            }
+            ApplicationAction::Example => {
+                // The fixture the conformance matrix renders through both
+                // backends. Printing that exact value means the example users
+                // start from cannot drift from the one that is proven to work.
+                println!("{}", application::EXHAUSTIVE_EXAMPLE.trim_start());
+                Ok(())
+            }
+            ApplicationAction::Portability { file, substrate } => {
+                let text = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let app = application::Application::parse(&text)?;
+                let target_is_kubernetes = substrate != "docker-host";
+                let ignored = app.non_portable_fields(target_is_kubernetes);
+                if ignored.is_empty() {
+                    println!(
+                        "✓ {} is fully portable to {substrate} (no substrate-specific blocks)",
+                        app.metadata.name
+                    );
+                } else {
+                    println!(
+                        "! {} carries configuration {substrate} will ignore:",
+                        app.metadata.name
+                    );
+                    for field in &ignored {
+                        println!("    spec.{field}");
+                    }
+                    println!(
+                        "  These are escape hatches, so this is expected — but the \n  \
+                         behaviour they provide will not exist on {substrate}."
+                    );
+                }
+                Ok(())
+            }
+        },
         Command::Up(a) => backend::select(&cfg, None)?.up(&up_options(&cfg, None, a)),
         Command::Down => backend::select(&cfg, None)?.down(&backend::DownOptions {
             config: cfg,
