@@ -122,6 +122,25 @@ pub fn capture_including_failures(bin: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run with `input` on stdin and return stdout regardless of exit status.
+///
+/// The combination `capture` and `run_stdin` cannot express: a command that needs
+/// a secret on stdin AND whose non-zero exit is information rather than failure
+/// (reading a secret that does not exist yet).
+pub fn capture_stdin_including_failures(bin: &str, args: &[&str], input: &str) -> Option<String> {
+    use std::io::Write;
+    let mut child = Command::new(bin)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(input.as_bytes()).ok()?;
+    let out = child.wait_with_output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Spawn a detached background process (e.g. a port-forward).
 pub fn spawn(bin: &str, args: &[&str]) -> Result<Child> {
     Command::new(bin)

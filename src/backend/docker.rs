@@ -427,6 +427,116 @@ fn unseal_openbao(env: &ResolvedEnv, workdir: &Path) -> Result<()> {
     .context("unsealing OpenBao")
 }
 
+/// Read one field of a secret, returning it rather than printing it.
+///
+/// `secret_get` prints, because it serves a human at a terminal. Callers that need
+/// the value to do something with — the cache provisioner — need it back.
+pub fn read_secret_field(
+    config: &Path,
+    env_name: Option<&str>,
+    path: &str,
+    key: &str,
+) -> Result<String> {
+    let data = read_secret_data(config, env_name, path)?;
+    data.get(key)
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("secret {path:?} has no field {key:?}"))
+}
+
+/// Every field of a secret, or an empty map when the secret does not exist yet.
+fn read_secret_data(
+    config: &Path,
+    env_name: Option<&str>,
+    path: &str,
+) -> Result<serde_yaml::Mapping> {
+    let cfg = DabbaConfig::load(config)?;
+    let env = cfg.resolve(env_name)?;
+    let workdir = env_workdir(config, &env.name)?;
+    let token = openbao_token(&workdir, &env.name)?;
+    if !valid_key_value_path(path) {
+        bail!("invalid secret path {path:?}");
+    }
+    let container = openbao_container()?;
+
+    // A missing secret is a normal state here (nothing has provisioned it yet), so
+    // the exit code is not treated as failure — the empty parse below handles it.
+    let script = format!(
+        "read -r BAO_TOKEN; export BAO_TOKEN BAO_ADDR=http://127.0.0.1:8200; \
+         bao kv get -format=json secret/{path} 2>/dev/null || true"
+    );
+    let output = run::capture_stdin_including_failures(
+        "docker",
+        &["exec", "-i", &container, "sh", "-c", &script],
+        &format!("{token}\n"),
+    )
+    .unwrap_or_default();
+
+    let parsed: serde_yaml::Value =
+        serde_yaml::from_str(&output).unwrap_or(serde_yaml::Value::Null);
+    Ok(parsed
+        .get("data")
+        .and_then(|d| d.get("data"))
+        .and_then(|d| d.as_mapping())
+        .cloned()
+        .unwrap_or_default())
+}
+
+/// Make sure each named field exists, generating a random value for any that does
+/// not. Fields already present are LEFT ALONE.
+///
+/// That is deliberate: reissuing a credential on every `up` would invalidate
+/// whatever CI currently holds, turning a routine re-run into an outage. Rotation
+/// has to be a separate, deliberate act.
+///
+/// `Some(value)` supplies a fixed value (an account name); `None` means generate.
+pub fn ensure_secret_fields(
+    config: &Path,
+    env_name: Option<&str>,
+    path: &str,
+    fields: &[(&str, Option<String>)],
+) -> Result<()> {
+    let existing = read_secret_data(config, env_name, path)?;
+    let mut to_write: Vec<(String, String)> = Vec::new();
+
+    for (key, fixed) in fields {
+        let present = existing
+            .get(serde_yaml::Value::String((*key).to_string()))
+            .and_then(|v| v.as_str())
+            .is_some_and(|v| !v.is_empty());
+        if present {
+            continue;
+        }
+        let value = match fixed {
+            Some(value) => value.clone(),
+            None => crate::backend::common::random_secret(24)?,
+        };
+        to_write.push(((*key).to_string(), value));
+    }
+    if to_write.is_empty() {
+        return Ok(());
+    }
+
+    // Merge rather than replace: `bao kv put` writes a whole new version, so
+    // putting only the new fields would silently drop every existing one.
+    let cfg = DabbaConfig::load(config)?;
+    let env = cfg.resolve(env_name)?;
+    let workdir = env_workdir(config, &env.name)?;
+    let token = openbao_token(&workdir, &env.name)?;
+
+    let mut pairs: Vec<String> = existing
+        .iter()
+        .filter_map(|(k, v)| Some(format!("{}='{}'", k.as_str()?, v.as_str()?)))
+        .collect();
+    for (key, value) in &to_write {
+        pairs.push(format!("{key}='{value}'"));
+    }
+    openbao(
+        &token,
+        &format!("bao kv put secret/{path} {}", pairs.join(" ")),
+    )
+}
+
 /// Run a `bao` command inside the OpenBao container, token on stdin.
 ///
 /// The token never appears in argv, which `ps` and /proc expose to every process on
@@ -740,6 +850,10 @@ fn reconciler_environment(
             Some(stacks_dir.to_string_lossy().into_owned()),
         ),
         ("GITOPS_APPS_DIR".to_string(), Some(apps_dir(env))),
+        (
+            "GITOPS_BRANCH".to_string(),
+            Some(env.substrate_str("gitopsBranch", "main")),
+        ),
         ("BOX_NAME".to_string(), box_name(env)),
         ("DABBA_ENVIRONMENT".to_string(), Some(env.name.clone())),
         (
@@ -949,6 +1063,88 @@ mod tests {
                  the systemd template, so the scheduled ticks would never see it"
             );
         }
+    }
+
+    /// The inverse of the test above, and the one that was missing.
+    ///
+    /// That test checks every variable dabba PASSES reaches the templates. It
+    /// cannot catch the opposite: a variable the reconciler READS that dabba never
+    /// passes. `gitopsBranch` was documented as a config knob in
+    /// examples/docker-host.yaml, honoured by reconcile.sh, and never plumbed —
+    /// so setting it did nothing, exactly like appsDir before it.
+    ///
+    /// The list is derived from reconcile.sh's own `VAR="${VAR:-default}"` lines
+    /// rather than hand-maintained, because a hand-maintained list is the thing
+    /// that keeps going wrong here.
+    #[test]
+    fn every_variable_the_reconciler_reads_is_passed_to_it() {
+        let reconciler = include_str!("../../backends/docker/reconcile.sh");
+
+        // Ambient environment, supplied by the shell or the scheduler rather than
+        // by dabba's configuration.
+        const AMBIENT: &[&str] = &["HOME", "USER", "TMPDIR", "PATH", "XDG_RUNTIME_DIR"];
+
+        let mut reads: Vec<String> = Vec::new();
+        for line in reconciler.lines() {
+            let line = line.trim();
+            // Matches: NAME="${NAME:-default}"
+            let Some((name, rest)) = line.split_once("=\"${") else {
+                continue;
+            };
+            if !name.chars().all(|c| c.is_ascii_uppercase() || c == '_') || name.is_empty() {
+                continue;
+            }
+            // The name must be the WHOLE variable being read, not a prefix of it.
+            // `BOX="${BOX_NAME:-...}"` assigns a local from a different variable,
+            // and a prefix match reported the local as unpassed configuration.
+            let Some(after) = rest.strip_prefix(name) else {
+                continue;
+            };
+            if !after.starts_with(":-") && !after.starts_with('}') {
+                continue;
+            }
+            if AMBIENT.contains(&name) || reads.iter().any(|r| r == name) {
+                continue;
+            }
+            reads.push(name.to_string());
+        }
+
+        assert!(
+            reads.len() >= 5,
+            "parsed only {} configuration variables out of reconcile.sh; the parser \
+             broke and this test would pass vacuously",
+            reads.len()
+        );
+
+        let passed: Vec<String> = reconciler_environment(
+            &environment("box1", "{}"),
+            Path::new("/tmp/gitops"),
+            Path::new("/tmp/stacks"),
+            Path::new("/tmp/workdir"),
+        )
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+
+        for name in reads {
+            assert!(
+                passed.contains(&name),
+                "reconcile.sh reads {name} but dabba never passes it, so any config \
+                 knob behind it silently does nothing"
+            );
+        }
+    }
+
+    #[test]
+    fn the_tracked_branch_is_configurable() {
+        let pairs = reconciler_environment(
+            &environment("box1", "{ gitopsBranch: release }"),
+            Path::new("/tmp/gitops"),
+            Path::new("/tmp/stacks"),
+            Path::new("/tmp/workdir"),
+        );
+        let branch = pairs.iter().find(|(k, _)| k == "GITOPS_BRANCH").unwrap();
+        assert_eq!(branch.1, Some("release".to_string()));
     }
 
     /// These strings must match backends/docker/install.sh, which derives the same

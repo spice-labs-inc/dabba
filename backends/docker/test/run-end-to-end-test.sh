@@ -35,6 +35,8 @@ BOX="dabbae2ebox"
 APP="secretconsumer"
 APP_PROJECT="gitops-$APP"
 OPENBAO_PROJECT="gitops-openbao"
+CACHE_PROJECT="gitops-cache"
+MC_IMAGE="minio/mc:RELEASE.2024-10-08T09-37-26Z"
 PORT="18093"
 SECRET_VALUE="delivered through dabba"
 
@@ -66,7 +68,7 @@ cleanup() {
         systemctl --user daemon-reload > /dev/null 2>&1
     fi
 
-    for project in "$APP_PROJECT" "$OPENBAO_PROJECT"; do
+    for project in "$APP_PROJECT" "$OPENBAO_PROJECT" "$CACHE_PROJECT"; do
         ids="$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null)"
         if [ -n "$ids" ]; then
             # shellcheck disable=SC2086  # deliberate word splitting over ids
@@ -78,7 +80,7 @@ cleanup() {
 
     # Prove it, rather than trusting the removals above.
     residue=""
-    for project in "$APP_PROJECT" "$OPENBAO_PROJECT"; do
+    for project in "$APP_PROJECT" "$OPENBAO_PROJECT" "$CACHE_PROJECT"; do
         [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null)" ] \
             && residue="$residue $project"
     done
@@ -248,7 +250,96 @@ else
 fi
 
 ###############################################################################
-step "5. down stops the loop and LEAVES THE STACKS RUNNING"
+step "5. the CI cache: a bucket, two credentials, and a trust map that holds"
+###############################################################################
+# Render the cache stack from the SAME portable definition that ships as an
+# example, so this exercises the real artifact rather than a test fixture.
+mkdir -p "$SEED/apps/$BOX/cache"
+"$DABBA" application render "$REPO_ROOT/examples/applications/cache-minio.yaml" \
+    --substrate docker-host > "$SEED/apps/$BOX/cache/docker-compose.yml"
+git -C "$SEED" add -A && git -C "$SEED" commit -q -m "add the cache stack"
+git -C "$SEED" push -q origin main 2>/dev/null || true
+
+# Drive convergence in the background so `dabba cache up` does not have to wait
+# out the minutely timer for the stack it just seeded credentials for.
+reconcile_forever() {
+    while true; do
+        GITOPS_DIR="$WORKDIR/gitops" STACKS_DIR="$WORKDIR/stacks" BOX_NAME="$BOX" \
+          DABBA_ENVIRONMENT="$ENVIRONMENT" OPENBAO_TOKEN_FILE="$WORKDIR/openbao-root" \
+          /bin/bash "$WORKDIR/reconciler/reconcile.sh" > /dev/null 2>&1
+        sleep 10
+    done
+}
+reconcile_forever & reconciler_pid=$!
+
+( cd "$WORKROOT" && "$DABBA" cache up -c "$CONFIG" ) 2>&1 | tail -8 | sed 's/^/  | /'
+kill "$reconciler_pid" 2>/dev/null; wait "$reconciler_pid" 2>/dev/null
+
+read_write_env="$( cd "$WORKROOT" && "$DABBA" cache credentials -c "$CONFIG" --scope read-write 2>/dev/null )"
+read_only_env="$( cd "$WORKROOT" && "$DABBA" cache credentials -c "$CONFIG" --scope read-only 2>/dev/null )"
+
+echo "$read_write_env" | grep -q 'AWS_ACCESS_KEY_ID=' \
+    && pass "read-write credentials are issued" || fail "no read-write credentials"
+echo "$read_only_env" | grep -q 'SCCACHE_READONLY=1' \
+    && pass "read-only credentials say so to sccache" \
+    || fail "read-only credentials do not set SCCACHE_READONLY"
+
+rw_key="$(echo "$read_write_env" | sed -n 's/^AWS_ACCESS_KEY_ID=//p')"
+rw_secret="$(echo "$read_write_env" | sed -n 's/^AWS_SECRET_ACCESS_KEY=//p')"
+ro_key="$(echo "$read_only_env" | sed -n 's/^AWS_ACCESS_KEY_ID=//p')"
+ro_secret="$(echo "$read_only_env" | sed -n 's/^AWS_SECRET_ACCESS_KEY=//p')"
+
+[ -n "$rw_key" ] && [ "$rw_key" != "$ro_key" ] \
+    && pass "the two scopes are different accounts" \
+    || fail "the scopes share an account ($rw_key / $ro_key)"
+
+# A tiny client run on the cache network, as one scope.
+as_scope() {
+    docker run --rm --network "${CACHE_PROJECT}_default" \
+        --env "MC_HOST_s=http://$1:$2@cache:9000" --entrypoint sh \
+        "$MC_IMAGE" -c "$3" 2>&1
+}
+
+echo "  --- read-write scope ---"
+echo "cache entry" > "$SCRATCH/object"
+if as_scope "$rw_key" "$rw_secret" "echo 'cache entry' > /tmp/o && mc cp /tmp/o s/sccache/probe" | grep -qiE 'error|denied'; then
+    fail "the read-write credential could not write"
+else
+    pass "read-write CAN write to the cache"
+fi
+
+echo "  --- read-only scope ---"
+if as_scope "$ro_key" "$ro_secret" "mc cat s/sccache/probe" | grep -q "cache entry"; then
+    pass "read-only CAN read the cache"
+else
+    fail "the read-only credential could not read"
+fi
+
+# THE security control. A read-only credential that can write means an untrusted
+# pull request can poison what a later trusted build links into a release.
+write_attempt="$(as_scope "$ro_key" "$ro_secret" "echo poison > /tmp/p && mc cp /tmp/p s/sccache/poisoned")"
+if echo "$write_attempt" | grep -qiE 'denied|forbidden|error'; then
+    pass "read-only CANNOT write (the trust map holds)"
+else
+    fail "READ-ONLY CREDENTIAL WAS ABLE TO WRITE — the cache can be poisoned"
+fi
+# And prove the refusal was real, not a client-side no-op.
+if as_scope "$rw_key" "$rw_secret" "mc ls s/sccache/poisoned" | grep -q 'poisoned'; then
+    fail "the poisoned object EXISTS despite the write appearing to fail"
+else
+    pass "no poisoned object exists in the bucket"
+fi
+
+# Deleting is a write too, and a cache you can empty is a cache you can degrade.
+delete_attempt="$(as_scope "$ro_key" "$ro_secret" "mc rm s/sccache/probe")"
+if echo "$delete_attempt" | grep -qiE 'denied|forbidden|error'; then
+    pass "read-only CANNOT delete"
+else
+    fail "READ-ONLY CREDENTIAL WAS ABLE TO DELETE"
+fi
+
+###############################################################################
+step "6. down stops the loop and LEAVES THE STACKS RUNNING"
 ###############################################################################
 ( cd "$WORKROOT" && "$DABBA" env "$ENVIRONMENT" down -c "$CONFIG" ) 2>&1 | sed 's/^/  | /'
 

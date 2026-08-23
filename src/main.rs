@@ -11,6 +11,7 @@
 
 mod application;
 mod backend;
+mod cache;
 mod config;
 mod edit;
 mod render;
@@ -90,6 +91,11 @@ enum Command {
     },
     /// Preflight checks (docker / tools / cluster reachable)
     Doctor,
+    /// The shared CI build cache: its bucket and two scoped credentials
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Work with portable application definitions
     Application {
         #[command(subcommand)]
@@ -142,6 +148,18 @@ enum SecretAction {
     Ls { path: Option<String> },
     /// Show a secret's value, e.g. `dabba/forgejo` or `local/openbao-root`
     Get { name: String },
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Create the bucket and both scoped credentials (idempotent)
+    Up,
+    /// Print one scope's credentials as shell exports, for CI to consume
+    Credentials {
+        /// read-write (trusted branches only) or read-only (same-repo pull requests)
+        #[arg(long, default_value = "read-only")]
+        scope: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -205,6 +223,12 @@ fn main() -> Result<()> {
             }
         },
         Command::Doctor => doctor(&cfg),
+        Command::Cache { action } => match action {
+            CacheAction::Up => cache::up(&cfg, None),
+            CacheAction::Credentials { scope } => {
+                cache::credentials(&cfg, None, cache::Scope::parse(&scope)?)
+            }
+        },
         Command::Application { action } => match action {
             ApplicationAction::Validate { file } => {
                 let text = std::fs::read_to_string(&file)
