@@ -137,6 +137,33 @@ pub fn render(app: &Application) -> Result<String> {
         root.insert(string("x-health-cmd"), string(health_command(app, health)?));
     }
 
+    // The compose file carries secret REFERENCES, never values: the ${VARIABLE}
+    // above says "resolve me", and this says where from. The reconciler reads this
+    // each tick and writes resolved values into the stack's box-local .env — the
+    // compose-host equivalent of External Secrets populating a Secret on Kubernetes.
+    //
+    // This file goes into a git repository, so the split is the whole point. A
+    // rendered artifact that inlined the value would commit every secret to git the
+    // moment anyone ran the renderer.
+    let secrets: Vec<(&str, String)> = app
+        .spec
+        .environment
+        .iter()
+        .filter_map(|variable| {
+            variable
+                .secret
+                .as_ref()
+                .map(|s| (variable.name.as_str(), format!("{}#{}", s.name, s.key)))
+        })
+        .collect();
+    if !secrets.is_empty() {
+        let mut mapping = Mapping::new();
+        for (name, reference) in secrets {
+            mapping.insert(string(name), string(reference));
+        }
+        root.insert(string("x-secrets"), Value::Mapping(mapping));
+    }
+
     let body = serde_yaml::to_string(&Value::Mapping(root))?;
     Ok(format!(
         "# Rendered by dabba from the portable Application definition for {name}.\n\
@@ -234,7 +261,28 @@ mod tests {
         assert!(text.contains("LITERAL_SETTING: literal-value"));
         // The secret's VALUE must never appear; only the indirection.
         assert!(text.contains("SECRET_SETTING: ${SECRET_SETTING}"));
-        assert!(!text.contains("key: message"));
+    }
+
+    /// The reference has to travel with the stack, or the reconciler cannot know
+    /// which secret a ${VARIABLE} wants. It must be a reference and nothing more.
+    #[test]
+    fn emits_secret_references_for_the_reconciler_to_resolve() {
+        let text = rendered();
+        assert!(
+            text.contains("x-secrets:"),
+            "no secret reference block:\n{text}"
+        );
+        assert!(text.contains("SECRET_SETTING: demo#message"));
+    }
+
+    /// A stack with no secrets must not carry an empty block that looks like a
+    /// resolution step the reconciler has to take.
+    #[test]
+    fn omits_the_secret_block_when_nothing_is_secret_backed() {
+        let mut app = Application::parse(EXHAUSTIVE_EXAMPLE).unwrap();
+        app.spec.environment.retain(|v| v.secret.is_none());
+        let text = render(&app).unwrap();
+        assert!(!text.contains("x-secrets"));
     }
 
     #[test]

@@ -88,8 +88,11 @@ spec:
     - { name: box, substrate: docker-host }
 "#;
 
+    /// Keyed by test name as well as process id: tests run in parallel, and an
+    /// earlier version shared one directory that each test deleted on its way out,
+    /// so whichever finished first pulled the file out from under the other.
     fn config_file(test: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("dabba-select-{}-{}", std::process::id(), test));
+        let dir = std::env::temp_dir().join(format!("dabba-select-{test}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dabba.yaml");
         std::fs::write(&path, CONFIG).unwrap();
@@ -129,7 +132,7 @@ spec:
 
     #[test]
     fn select_fails_loudly_on_an_unknown_environment() {
-        let config = config_file("unknown-env");
+        let config = config_file("unknown");
         assert!(select(&config, Some("nonexistent")).is_err());
         std::fs::remove_dir_all(config.parent().unwrap()).ok();
     }

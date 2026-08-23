@@ -40,6 +40,12 @@ GITOPS_APPS_DIR="${GITOPS_APPS_DIR:-apps}"
 # The branch this box tracks. Was hard-coded to "main"; a repo whose default
 # branch is named anything else could never converge and never said so.
 GITOPS_BRANCH="${GITOPS_BRANCH:-main}"
+# Where to reach OpenBao, and the file holding its root token. dabba writes the
+# token file at 0600 in the environment's working directory; it is deliberately
+# NOT in git and NOT in this repo. Unset means secret resolution is disabled and
+# a stack that needs a secret fails loudly rather than deploying half-configured.
+OPENBAO_PROJECT="${OPENBAO_PROJECT:-gitops-openbao}"
+OPENBAO_TOKEN_FILE="${OPENBAO_TOKEN_FILE:-}"
 BOX_DIR="$GITOPS_DIR/$GITOPS_APPS_DIR/$BOX"
 
 # Consecutive-fetch-failure counter, kept in the reconciler-owned stacks dir.
@@ -170,10 +176,9 @@ sync_launchd_agents() {
     if [ -d "$src" ]; then
         for p in "$src"/*.plist; do
             [ -f "$p" ] || continue
-            local name label rendered
+            local name label rendered declared
             name="$(basename "$p")"
             label="${name%.plist}"                 # convention: Label == filename sans .plist
-            new="$new$name"$'\n'
             # Render the template, then compare the RENDERED plist against the
             # installed one so a token-only change (e.g. STACKS_DIR moved) is
             # still detected.
@@ -181,6 +186,19 @@ sync_launchd_agents() {
             sed -e "s|__STACK_DIR__|$stack_dir|g" \
                 -e "s|__DOCKER__|$docker_bin|g" \
                 -e "s|__APP__|$app|g" "$p" > "$rendered"
+            # The reconciler boots agents in and out by "gui/<uid>/<label>", so a
+            # plist whose Label disagrees with its filename installs once and can
+            # then never be updated or removed — it would outlive its own removal
+            # from git. Refuse it instead of installing something unmanageable.
+            declared="$(sed -n '/<key>Label<\/key>/{n;s|.*<string>\(.*\)</string>.*|\1|p;}' "$rendered")"
+            if [ "$declared" != "$label" ]; then
+                echo "ERROR: $app: $name declares Label '$declared'; the reconciler" >&2
+                echo "       manages agents by filename, so rename the file to" >&2
+                echo "       '$declared.plist' or change the Label to '$label'." >&2
+                rm -f "$rendered"
+                continue
+            fi
+            new="$new$name"$'\n'
             if ! cmp -s "$rendered" "$agent_dir/$name"; then
                 # bootout the old agent (ignore if it was never loaded), install
                 # the freshly rendered plist, then bootstrap it back in.
@@ -298,6 +316,124 @@ extract_bind_sources() {
     ' "$1" | sort -u
 }
 
+# ---- secret resolution -----------------------------------------------------
+# A rendered stack carries secret REFERENCES, never values:
+#
+#   environment:
+#     SECRET_SETTING: ${SECRET_SETTING}
+#   x-secrets:
+#     SECRET_SETTING: demo#message
+#
+# The compose file lives in git, so it must never hold the value. This resolves
+# each reference from OpenBao and writes it into the stack's own .env, which
+# compose interpolates at `up` — the compose-host equivalent of External Secrets
+# populating a Secret on Kubernetes. Same declaration in the Application, two
+# mechanisms, same meaning.
+#
+# The .env is written 0600 and rewritten every tick, so a rotated secret reaches
+# the box on the next minute without anyone redeploying.
+
+# Read the x-secrets block of a rendered compose file as "VAR PATH KEY" lines.
+# Portable awk: the block is a flat map of VAR: path#key under a top-level key.
+extract_secret_references() {
+    awk '
+        /^x-secrets:/ { inside = 1; next }
+        # Any other top-level key ends the block.
+        /^[^[:space:]]/ { inside = 0 }
+        inside && /^[[:space:]]+[A-Za-z_][A-Za-z0-9_]*:/ {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            split(line, parts, ":")
+            variable = parts[1]
+            reference = substr(line, index(line, ":") + 1)
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", reference)
+            gsub(/\047|\042/, "", reference)
+            hash = index(reference, "#")
+            if (hash > 0) {
+                printf "%s %s %s\n", variable, substr(reference, 1, hash - 1), substr(reference, hash + 1)
+            }
+        }
+    ' "$1"
+}
+
+# Read one key out of OpenBao. Token travels on stdin, never in argv, because
+# argv is visible to every process on the box via ps.
+openbao_read() {
+    local path="$1" key="$2"
+    docker exec -i "$(openbao_container)" sh -c \
+        'read -r BAO_TOKEN; export BAO_TOKEN BAO_ADDR=http://127.0.0.1:8200; \
+         bao kv get -field="$1" "secret/$2" 2>/dev/null' _ "$key" "$path" \
+        < "$OPENBAO_TOKEN_FILE"
+}
+
+openbao_container() {
+    docker ps -q --filter "label=com.docker.compose.project=$OPENBAO_PROJECT" \
+                --filter "status=running" | head -1
+}
+
+# Resolve every reference in $2 into $1/.env. Returns non-zero if any reference
+# could not be resolved — a stack deployed with a missing secret is a stack that
+# will fail in a way nobody connects back to this.
+sync_secrets() {
+    local applied_dir="$1" compose_file="$2" app="$3"
+    local references
+    references="$(extract_secret_references "$compose_file")"
+    [ -n "$references" ] || return 0
+
+    if [ -z "$OPENBAO_TOKEN_FILE" ] || [ ! -f "$OPENBAO_TOKEN_FILE" ]; then
+        echo "ERROR: $app: needs secrets but no OpenBao token is available" >&2
+        echo "       (expected OPENBAO_TOKEN_FILE; run \`dabba env <name> up\`)" >&2
+        return 1
+    fi
+    if [ -z "$(openbao_container)" ]; then
+        echo "ERROR: $app: needs secrets but the $OPENBAO_PROJECT stack is not running" >&2
+        return 1
+    fi
+
+    # Rebuild the secret half of .env from scratch each tick, preserving the
+    # non-secret half (COMPOSE_PROJECT_NAME and anything an operator added).
+    #
+    # The marker line is the boundary: everything above it is operator-owned and
+    # kept verbatim, everything below it dabba wrote last tick and is rebuilt.
+    # Selecting by variable NAME instead got this wrong in both directions: an
+    # unanchored "PASSWORD=" also matched an operator's DB_PASSWORD= line and
+    # deleted it, and a reference dropped from the compose file matched nothing,
+    # so its resolved value stayed in .env indefinitely.
+    local env_file="$applied_dir/.env" kept failed=""
+    kept="$(sed '/^# dabba-secret/,$d' "$env_file" 2>/dev/null || true)"
+
+    local resolved="" variable path key value
+    while read -r variable path key; do
+        [ -n "$variable" ] || continue
+        value="$(openbao_read "$path" "$key")"
+        if [ -z "$value" ]; then
+            echo "ERROR: $app: secret $path#$key is empty or unreadable" >&2
+            failed=1
+            continue
+        fi
+        resolved="$resolved$variable=$value"$'\n'
+    done <<EOF
+$references
+EOF
+
+    [ -n "$failed" ] && return 1
+
+    # Restored below: this runs mid-tick, and leaving 077 set would silently
+    # change the mode of every file the rest of the reconcile pass creates.
+    local prior_umask
+    prior_umask="$(umask)"
+    umask 077
+    {
+        [ -n "$kept" ] && printf '%s\n' "$kept"
+        echo "# dabba-secret: resolved from OpenBao; do not edit or commit"
+        printf '%s' "$resolved"
+    } > "$env_file"
+    umask "$prior_umask"
+    chmod 600 "$env_file"
+    echo "$app: resolved $(printf '%s\n' "$references" | grep -c .) secret(s) from OpenBao"
+    return 0
+}
+
 # ---- health gate -----------------------------------------------------------
 # The optional per-stack `x-health-cmd`, as a re-runnable function. `attempts`
 # is how many 5s tries to give it: 24 (two minutes) right after a deploy, 1 on a
@@ -359,6 +495,12 @@ for dir in "$BOX_DIR"/*/; do
     fi
     if [ -f "$applied" ] && cmp -s "$desired" "$applied"; then
         rm -f "$desired"
+        # A rotated secret changes nothing in git, so a no-diff tick must still
+        # refresh the .env — otherwise rotation would require a cosmetic commit.
+        if ! sync_secrets "$applied_dir" "$applied" "$app" > /dev/null; then
+            echo "ERROR: $app: secret refresh failed" >&2
+            rc=1
+        fi
         # In sync. That is not the same as working: re-check a stack we last saw
         # unhealthy, so it keeps alerting until it recovers or someone fixes it.
         if [ "$(health_state "$applied_dir")" = "failed" ]; then
@@ -390,6 +532,15 @@ for dir in "$BOX_DIR"/*/; do
     fi
     cp "$desired" "$applied"
     rm -f "$desired"
+
+    # Secrets must land before `compose up` interpolates the .env, and a failure
+    # here must stop the deploy: a stack brought up with an unresolved secret
+    # starts with an empty value and fails somewhere far from the cause.
+    if ! sync_secrets "$applied_dir" "$applied" "$app"; then
+        rm -f "$applied"    # keep the diff so the next tick retries
+        rc=1
+        continue
+    fi
     # --force-recreate: compose does not consider inline `configs: content:`
     # changes when deciding whether to recreate, so a config-only edit would
     # silently keep the old container running. We only reach this point when

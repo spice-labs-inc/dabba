@@ -33,7 +33,7 @@
 //! SEAM for a later increment (deliberately not built here): `diagram` for compose
 //! topology. `dabba status` covers the same ground in text.
 
-use crate::backend::common::{env_workdir, expand_tilde, log, on_path};
+use crate::backend::common::{env_workdir, expand_tilde, log, on_path, read_stash};
 use crate::backend::reconciler_assets::{self, REQUIRED_SCRIPTS};
 use crate::backend::{Backend, DownOptions, Options};
 use crate::config::{DabbaConfig, ResolvedEnv};
@@ -57,6 +57,15 @@ fn systemd_timer(env_name: &str) -> String {
     format!("gitops-reconcile-{env_name}.timer")
 }
 
+/// The compose project OpenBao runs as, matching the reconciler's convention and
+/// the example stack under `backends/docker/examples/openbao/`.
+const OPENBAO_PROJECT: &str = "gitops-openbao";
+/// The root token, stashed in the environment's working directory rather than in
+/// OpenBao — for the same reason the Kubernetes path stashes it there: the key to
+/// the vault cannot live inside the vault it opens.
+const OPENBAO_ROOT_TOKEN: &str = "openbao-root";
+const OPENBAO_UNSEAL_KEY: &str = "openbao-unseal";
+
 /// The bare-OS docker-compose backend. Selected for the `docker-host` substrate.
 pub struct DockerBackend;
 
@@ -76,23 +85,144 @@ impl Backend for DockerBackend {
              compose topology is a later increment; use `dabba status` for now"
         )
     }
-    fn secret_ls(
-        &self,
-        _config: &Path,
-        _env_name: Option<&str>,
-        _path: Option<&str>,
-    ) -> Result<()> {
-        bail!(secret_not_yet())
+    fn secret_ls(&self, config: &Path, env_name: Option<&str>, path: Option<&str>) -> Result<()> {
+        secret_ls(config, env_name, path)
     }
-    fn secret_get(&self, _config: &Path, _env_name: Option<&str>, _name: &str) -> Result<()> {
-        bail!(secret_not_yet())
+    fn secret_get(&self, config: &Path, env_name: Option<&str>, name: &str) -> Result<()> {
+        secret_get(config, env_name, name)
     }
 }
 
-fn secret_not_yet() -> &'static str {
-    "secrets are not yet wired on the docker backend. The compose-host equivalent of \
-     External Secrets (OpenBao shipped as a managed gitops-openbao container) is a \
-     later increment; today the reconciler reads a box-local .env only."
+/// Secrets dabba keeps OUTSIDE OpenBao, listed under `local/` exactly as the
+/// Kubernetes backend lists its own.
+const STASH_SECRETS: &[&str] = &[OPENBAO_ROOT_TOKEN, OPENBAO_UNSEAL_KEY];
+
+fn secret_ls(config: &Path, env_name: Option<&str>, path: Option<&str>) -> Result<()> {
+    let cfg = DabbaConfig::load(config)?;
+    let env = cfg.resolve(env_name)?;
+    let workdir = env_workdir(config, &env.name)?;
+
+    if path.is_none() || path == Some("local") {
+        let present: Vec<&str> = STASH_SECRETS
+            .iter()
+            .copied()
+            .filter(|name| !read_stash(&workdir, name).is_empty())
+            .collect();
+        if !present.is_empty() {
+            println!("local/");
+            for name in present {
+                println!("    {name}");
+            }
+        }
+        if path == Some("local") {
+            return Ok(());
+        }
+    }
+
+    let token = openbao_token(&workdir, &env.name)?;
+    let path = path.unwrap_or("secret");
+    if !valid_key_value_path(path) {
+        bail!("invalid secret path {path:?}");
+    }
+    openbao(&token, &format!("bao kv list -format=table {path}"))
+}
+
+fn secret_get(config: &Path, env_name: Option<&str>, name: &str) -> Result<()> {
+    let cfg = DabbaConfig::load(config)?;
+    let env = cfg.resolve(env_name)?;
+    let workdir = env_workdir(config, &env.name)?;
+
+    if let Some(stash_name) = name.strip_prefix("local/") {
+        if !STASH_SECRETS.contains(&stash_name) {
+            bail!(
+                "unknown local secret {stash_name:?}; known: {}",
+                STASH_SECRETS.join(", ")
+            );
+        }
+        let value = read_stash(&workdir, stash_name);
+        if value.is_empty() {
+            bail!(
+                "no stashed {stash_name} for env {:?} (not deployed?)",
+                env.name
+            );
+        }
+        println!("{value}");
+        return Ok(());
+    }
+
+    let token = openbao_token(&workdir, &env.name)?;
+    let path = if name.starts_with("secret/") {
+        name.to_string()
+    } else {
+        format!("secret/{name}")
+    };
+    if !valid_key_value_path(&path) {
+        bail!("invalid secret path {name:?}");
+    }
+    openbao(&token, &format!("bao kv get -format=table {path}"))
+}
+
+/// Path segments are restricted so a crafted name cannot break out of the shell
+/// command it is interpolated into.
+fn valid_key_value_path(path: &str) -> bool {
+    !path.is_empty()
+        && path.split('/').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        })
+}
+
+fn openbao_token(workdir: &Path, env_name: &str) -> Result<String> {
+    let token = read_stash(workdir, OPENBAO_ROOT_TOKEN);
+    if token.is_empty() {
+        bail!(
+            "no OpenBao token for env {env_name:?}. Bring the environment up with the \
+             openbao stack in its gitops content (see backends/docker/examples/openbao/)."
+        );
+    }
+    Ok(token)
+}
+
+/// The running OpenBao container on this box, or an error naming what is missing.
+fn openbao_container() -> Result<String> {
+    let output = run::capture(
+        "docker",
+        &[
+            "ps",
+            "-q",
+            "--filter",
+            &format!("label=com.docker.compose.project={OPENBAO_PROJECT}"),
+            "--filter",
+            "status=running",
+        ],
+    )
+    .unwrap_or_default();
+    let id = output.lines().next().unwrap_or_default().trim().to_string();
+    if id.is_empty() {
+        bail!(
+            "the {OPENBAO_PROJECT} stack is not running on this box. Add the openbao \
+             stack to this box's gitops content (see backends/docker/examples/openbao/) \
+             and let the reconcile loop converge it."
+        );
+    }
+    Ok(id)
+}
+
+/// Run a `bao` command inside the OpenBao container, token on stdin.
+///
+/// The token never appears in argv, which `ps` and /proc expose to every process on
+/// the box — the same reasoning as the Kubernetes backend's equivalent.
+fn openbao(token: &str, command: &str) -> Result<()> {
+    let container = openbao_container()?;
+    let script =
+        format!("read -r BAO_TOKEN; export BAO_TOKEN BAO_ADDR=http://127.0.0.1:8200; {command}");
+    run::run_stdin(
+        "docker",
+        &["exec", "-i", &container, "sh", "-c", &script],
+        &format!("{token}\n"),
+    )
 }
 
 fn up(opts: &Options) -> Result<()> {
@@ -132,7 +262,7 @@ fn up(opts: &Options) -> Result<()> {
     run::run_with_environment(
         "bash",
         &[install_str.as_ref()],
-        &reconciler_environment(&env, &gitops_dir, &stacks_dir),
+        &reconciler_environment(&env, &gitops_dir, &stacks_dir, &workdir),
     )?;
 
     print_up_summary(&env.name, &gitops_dir, &stacks_dir, &backend_dir);
@@ -377,6 +507,7 @@ fn reconciler_environment(
     env: &ResolvedEnv,
     gitops_dir: &Path,
     stacks_dir: &Path,
+    workdir: &Path,
 ) -> Vec<(String, Option<String>)> {
     vec![
         (
@@ -390,6 +521,21 @@ fn reconciler_environment(
         ("GITOPS_APPS_DIR".to_string(), Some(apps_dir(env))),
         ("BOX_NAME".to_string(), box_name(env)),
         ("DABBA_ENVIRONMENT".to_string(), Some(env.name.clone())),
+        (
+            "OPENBAO_PROJECT".to_string(),
+            Some(OPENBAO_PROJECT.to_string()),
+        ),
+        // Where the reconciler reads the token from when resolving x-secrets. The
+        // token travels as a path, never as a value in the environment.
+        (
+            "OPENBAO_TOKEN_FILE".to_string(),
+            Some(
+                workdir
+                    .join(OPENBAO_ROOT_TOKEN)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ),
     ]
 }
 
@@ -493,6 +639,7 @@ mod tests {
             &environment("box1", "{}"),
             Path::new("/tmp/gitops"),
             Path::new("/tmp/stacks"),
+            Path::new("/tmp/workdir"),
         );
         let box_name = pairs.iter().find(|(k, _)| k == "BOX_NAME").unwrap();
         assert_eq!(box_name.1, None, "BOX_NAME must be removed, not inherited");
@@ -504,6 +651,7 @@ mod tests {
             &environment("box1", "{ boxName: alpha, appsDir: deployments }"),
             Path::new("/tmp/gitops"),
             Path::new("/tmp/stacks"),
+            Path::new("/tmp/workdir"),
         );
         let get = |key: &str| {
             pairs
@@ -519,6 +667,19 @@ mod tests {
         assert_eq!(get("BOX_NAME"), Some("alpha".to_string()));
         // Without this the loop installs under the wrong scheduler identity.
         assert_eq!(get("DABBA_ENVIRONMENT"), Some("box1".to_string()));
+        // The reconciler resolves x-secrets by reading the token from this path.
+        // The token itself must never travel through the environment, where the
+        // child's /proc would expose it.
+        assert_eq!(
+            get("OPENBAO_TOKEN_FILE"),
+            Some("/tmp/workdir/openbao-root".to_string())
+        );
+        assert!(
+            !pairs.iter().any(|(_, value)| value
+                .as_deref()
+                .is_some_and(|v| v.len() > 20 && !v.contains('/'))),
+            "a secret-looking value is being passed through the environment"
+        );
     }
 
     /// Two environments must never share a scheduler identity, or the second `up`
@@ -588,6 +749,38 @@ mod tests {
             "got: {error}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The path is interpolated into a shell command inside the container, so a
+    /// crafted name must be rejected before it gets there rather than escaped.
+    #[test]
+    fn secret_paths_reject_anything_that_could_escape_a_shell_command() {
+        for good in ["secret", "secret/demo", "secret/demo/podinfo", "a-b_c.d"] {
+            assert!(valid_key_value_path(good), "{good} should be valid");
+        }
+        for bad in [
+            "",
+            "secret/",
+            "/secret",
+            "secret//demo",
+            "demo; rm -rf /",
+            "demo$(whoami)",
+            "demo`id`",
+            "demo && echo",
+            "demo\nkv list",
+            "demo'",
+        ] {
+            assert!(!valid_key_value_path(bad), "{bad:?} should be rejected");
+        }
+    }
+
+    /// `local/` names the stash that deliberately lives outside OpenBao. Anything
+    /// not in it must be rejected rather than read from an arbitrary file.
+    #[test]
+    fn only_known_names_resolve_under_local() {
+        assert!(STASH_SECRETS.contains(&OPENBAO_ROOT_TOKEN));
+        assert!(STASH_SECRETS.contains(&OPENBAO_UNSEAL_KEY));
+        assert!(!STASH_SECRETS.contains(&"../../etc/passwd"));
     }
 
     #[test]

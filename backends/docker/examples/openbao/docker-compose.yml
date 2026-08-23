@@ -1,0 +1,57 @@
+# OpenBao as a reconciled stack — the compose-host equivalent of the OpenBao that
+# the Kubernetes substrate runs in-cluster, and the thing that makes secret-backed
+# environment variables work on a bare box.
+#
+# File storage, not `-dev`. A dev-mode server keeps everything in memory, so every
+# restart silently empties the vault; that is fine for a demo and actively
+# dangerous as the thing holding a box's credentials.
+#
+# The cost of real storage is that a fresh server starts sealed and must be
+# initialised and unsealed. `dabba env <name> up` does both and stashes the unseal
+# key and root token in the environment's working directory at 0600 — for the same
+# reason the Kubernetes path stashes them there: the key to the vault cannot live
+# inside the vault it opens.
+#
+# Bound to loopback. This is a secret store for stacks on this box, and every one
+# of them reaches it over the compose network, not the host port. The published
+# port exists so `dabba secret get` and the operator can reach it locally.
+services:
+  openbao:
+    image: openbao/openbao:2.1.0
+    command: server -config=/openbao/config/config.hcl
+    ports:
+      - "127.0.0.1:8220:8200"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /openbao/data
+    cap_add:
+      # OpenBao locks its memory so secrets cannot be paged to disk.
+      - IPC_LOCK
+    restart: unless-stopped
+    configs:
+      - source: openbao-config
+        target: /openbao/config/config.hcl
+
+configs:
+  openbao-config:
+    content: |
+      ui = false
+      storage "file" {
+        path = "/openbao/data"
+      }
+      listener "tcp" {
+        address     = "0.0.0.0:8200"
+        tls_disable = true
+      }
+      # A single-box store: no HA, and no cluster address to advertise.
+      disable_mlock = false
+
+# The reconciler's health gate. A sealed OpenBao is running but useless, so the
+# gate checks initialised-and-unsealed rather than merely "the port answers" —
+# the same distinction between deployed and working that the readiness probe
+# draws on Kubernetes.
+x-health-cmd: >-
+  test "$(docker run --rm --network gitops-openbao_default curlimages/curl:latest
+  -fsS --max-time 5 http://openbao:8200/v1/sys/health?standbyok=true
+  -o /dev/null -w '%{http_code}')" = "200"
