@@ -57,6 +57,34 @@ jobs:
           fi
           echo "no gitops-* containers left behind"
 
+  # What the Kubernetes renderer emits must be something a real API server would
+  # accept. Validated against the published Kubernetes schemas rather than a
+  # cluster, so it gates every pull request instead of needing one — and it
+  # catches the realistic failure, which is the renderer emitting a wrong type or
+  # a field that does not exist.
+  rendered-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: render the exhaustive example for both substrates
+        run: |
+          ./target/release/dabba application example > /tmp/application.yaml
+          ./target/release/dabba application render /tmp/application.yaml \
+            --substrate kind > /tmp/rendered-kubernetes.yaml
+          ./target/release/dabba application render /tmp/application.yaml \
+            --substrate docker-host > /tmp/rendered-compose.yml
+      - name: the Kubernetes output validates against real schemas
+        run: |
+          docker run --rm -v /tmp:/work ghcr.io/yannh/kubeconform:latest \
+            -strict -summary -kubernetes-version 1.31.0 /work/rendered-kubernetes.yaml
+      - name: the compose output is something docker compose accepts
+        run: |
+          mkdir -p /tmp/stack && mv /tmp/rendered-compose.yml /tmp/stack/docker-compose.yml
+          cd /tmp/stack && docker compose config > /dev/null
+
   # Dependency advisories, license policy, banned/duplicate crates, source allow-list.
   cargo-deny:
     runs-on: ubuntu-latest
