@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  EXAMPLE macOS scheduled-job LaunchAgent, shipped by a stack at
+  <box>/<app>/launchd/<label>.plist. This is a TEMPLATE: reconcile.sh's
+  sync_launchd_agents() substitutes the tokens below before installing it into
+  ~/Library/LaunchAgents and bootstrapping it into the user GUI domain.
+
+  Tokens the reconciler renders:
+    __DOCKER__     absolute path to the docker binary on this box
+    __STACK_DIR__  <STACKS_DIR>/<app> — the app's applied stack directory
+    __APP__        the app name (available if you want it in the Label etc.)
+
+  Convention: the job is a one-shot container of the stack, run behind the
+  `jobs` compose profile so the reconciler's `up -d` never starts it as a
+  long-running service:
+      docker compose --profile jobs run --rm <service>
+
+  Label MUST equal the filename without ".plist" (the reconciler boots the
+  agent in/out by "gui/<uid>/<label>").
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.spicelabs.dabba.cron.example-app.nightly-backup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__DOCKER__</string>
+        <string>compose</string>
+        <string>--profile</string>
+        <string>jobs</string>
+        <string>run</string>
+        <string>--rm</string>
+        <string>backup</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__STACK_DIR__</string>
+
+    <!-- Every day at 03:30 local time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>3</integer>
+        <key>Minute</key>
+        <integer>30</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__STACK_DIR__/nightly-backup.log</string>
+    <key>StandardErrorPath</key>
+    <string>__STACK_DIR__/nightly-backup.log</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

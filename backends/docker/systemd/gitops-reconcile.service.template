@@ -1,0 +1,25 @@
+# dabba DockerBackend reconcile — converges this box's compose stacks to the
+# gitops repo's desired state. Triggered by gitops-reconcile.timer.
+#
+# Installed as a systemd USER unit (systemctl --user) by install.sh, which
+# substitutes the placeholder tokens. This is a --user unit
+# (no `User=`, no system-level ordering against docker.service — those are not
+# addressable from the user manager; the minutely retry covers a not-yet-ready
+# docker at boot). Requires `loginctl enable-linger <user>` so it runs without
+# an active login session.
+[Unit]
+Description=dabba DockerBackend gitops reconcile
+OnFailure=__UNIT_BASE__-alert.service
+
+[Service]
+Type=oneshot
+Environment=GITOPS_DIR=__GITOPS_DIR__
+Environment=STACKS_DIR=__STACKS_DIR__
+Environment=BOX_NAME=__BOX_NAME__
+Environment=GITOPS_APPS_DIR=__GITOPS_APPS_DIR__
+Environment=GITOPS_BRANCH=__GITOPS_BRANCH__
+Environment=DABBA_ENVIRONMENT=__DABBA_ENVIRONMENT__
+ExecStart=/bin/bash __RECONCILE_SH__
+# Optional secrets (e.g. SLACK_WEBHOOK_URL) — the leading '-' makes it optional.
+EnvironmentFile=-%h/.dabba-reconcile.env
+TimeoutStartSec=30min

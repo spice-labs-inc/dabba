@@ -1,0 +1,11 @@
+# EXAMPLE schedule for example-cron.service (Linux systemd USER timer).
+# Shipped at <box>/<app>/systemd/<app>-<job>.timer; the reconciler enables it.
+[Unit]
+Description=example-app nightly backup schedule (dabba gitops cron)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

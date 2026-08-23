@@ -1,0 +1,16 @@
+# EXAMPLE Linux scheduled-job systemd USER service, shipped by a stack at
+# <box>/<app>/systemd/<app>-<job>.service (paired with a .timer below).
+# reconcile.sh's sync_systemd_units() installs it verbatim into
+# ~/.config/systemd/user/. Unlike the macOS launchd plists these are NOT
+# token-rendered — systemd expands %h itself.
+#
+# Convention: the job is a one-shot container of the stack run behind the
+# `jobs` compose profile, so the reconciler's `up -d` never starts it as a
+# long-running service.
+[Unit]
+Description=example-app nightly backup (dabba gitops cron)
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/stacks/example-app
+ExecStart=/usr/bin/docker compose --profile jobs run --rm backup

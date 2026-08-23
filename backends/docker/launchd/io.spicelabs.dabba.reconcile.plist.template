@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  dabba DockerBackend reconcile loop (macOS launchd equivalent of
+  gitops-reconcile.{service,timer}). install.sh substitutes the placeholder tokens below and installs the
+  result at ~/Library/LaunchAgents/io.spicelabs.dabba.reconcile.plist.
+
+  StartInterval 60  -> run reconcile.sh once a minute (cheap no-op when in sync).
+  RunAtLoad true    -> also run immediately on load / login.
+  __PATH__          -> the PATH captured at install time, so launchd (which
+                       otherwise hands the job a spartan PATH) can find docker/git.
+
+  ProgramArguments runs reconcile-with-alerting.sh rather than reconcile.sh:
+  launchd has no OnFailure= equivalent, so the wrapper is what turns a non-zero
+  reconcile into an actual alert. See that script for the full reasoning.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>__LABEL__</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__BACKEND_DIR__/reconcile-with-alerting.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>GITOPS_DIR</key>
+        <string>__GITOPS_DIR__</string>
+        <key>STACKS_DIR</key>
+        <string>__STACKS_DIR__</string>
+        <key>BOX_NAME</key>
+        <string>__BOX_NAME__</string>
+        <key>GITOPS_APPS_DIR</key>
+        <string>__GITOPS_APPS_DIR__</string>
+        <key>GITOPS_BRANCH</key>
+        <string>__GITOPS_BRANCH__</string>
+        <key>DABBA_ENVIRONMENT</key>
+        <string>__DABBA_ENVIRONMENT__</string>
+        <key>PATH</key>
+        <string>__PATH__</string>
+    </dict>
+
+    <key>StartInterval</key>
+    <integer>60</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>__LOG__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG__</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>

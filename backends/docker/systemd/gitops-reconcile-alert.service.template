@@ -1,0 +1,11 @@
+# Failure alert for gitops-reconcile.service. Activated via OnFailure=; not
+# enabled or timed on its own. Installed as a systemd USER unit by install.sh,
+# which renders __BACKEND_DIR__.
+[Unit]
+Description=dabba DockerBackend gitops reconcile failure alert
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash __BACKEND_DIR__/reconcile-alert.sh __UNIT_BASE__.service
+EnvironmentFile=-%h/.dabba-reconcile.env
+TimeoutStartSec=5min

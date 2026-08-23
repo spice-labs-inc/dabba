@@ -1,0 +1,11 @@
+# Minutely trigger for gitops-reconcile.service (cheap no-op when in sync).
+# Installed as a systemd USER unit by install.sh, one per dabba environment.
+[Unit]
+Description=dabba DockerBackend gitops reconcile timer (__DABBA_ENVIRONMENT__)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=1min
+
+[Install]
+WantedBy=timers.target
