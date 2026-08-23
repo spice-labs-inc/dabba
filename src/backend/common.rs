@@ -5,7 +5,7 @@
 //! path/env utilities, and the config-level `ls`/`show` commands (which are the
 //! same for any backend). Process helpers live in [`crate::run`].
 
-use crate::config::DabbaConfig;
+use crate::config::{DabbaConfig, Substrate};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -88,8 +88,8 @@ pub fn log(msg: &str) {
 }
 
 /// `dabba ls` — list the configured environments and which one is the default.
-/// Backend-neutral: it reads the config and each env's workdir, independent of how
-/// the env is run.
+/// The listing itself is backend-neutral, but "is it deployed?" is not: each
+/// substrate answers that its own way (see the match below).
 pub fn ls(config: &Path) -> Result<()> {
     let cfg = DabbaConfig::load(config)?;
     let default = cfg.default_env_name().ok();
@@ -99,10 +99,19 @@ pub fn ls(config: &Path) -> Result<()> {
         } else {
             " "
         };
-        let deployed = env_workdir(config, &env.name)
-            .ok()
-            .map(|w| w.join("01-cluster").join(".terraform").is_dir() || env.kubeconfig.is_some())
-            .unwrap_or(false);
+        // Ask the substrate what "deployed" means for it. This used to be a
+        // Kubernetes-only probe living in a helper that called itself
+        // backend-neutral, so a docker-host environment with a running reconcile
+        // loop and live stacks was never reported as deployed.
+        let deployed = match env.substrate {
+            Substrate::DockerHost => crate::backend::docker::is_deployed(&env.name),
+            _ => env_workdir(config, &env.name)
+                .ok()
+                .map(|w| {
+                    w.join("01-cluster").join(".terraform").is_dir() || env.kubeconfig.is_some()
+                })
+                .unwrap_or(false),
+        };
         println!(
             "{marker} {:<16} {:?}{}",
             env.name,

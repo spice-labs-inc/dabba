@@ -170,7 +170,7 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Command::Doctor => doctor(),
+        Command::Doctor => doctor(&cfg),
         Command::Up(a) => backend::select(&cfg, None)?.up(&up_options(&cfg, None, a)),
         Command::Down => backend::select(&cfg, None)?.down(&backend::DownOptions {
             config: cfg,
@@ -241,8 +241,26 @@ const MIN_TOFU: &str = "1.6.0";
 
 /// Check the day-0 prerequisites: tools present, the right versions, and (for
 /// docker) actually running.
-fn doctor() -> Result<()> {
+/// `dabba doctor` — check the tools the CONFIGURED substrates actually need.
+///
+/// This used to demand kubectl and tofu unconditionally, so it failed for anyone
+/// whose only environment was docker-host — on a substrate whose entire premise is
+/// not needing Kubernetes. A missing config is treated as "might be anything", so
+/// running `dabba doctor` before `dabba init` still checks everything.
+fn doctor(config: &Path) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
+
+    let substrates: Vec<config::Substrate> = config::DabbaConfig::load(config)
+        .map(|cfg| cfg.spec.environments.iter().map(|e| e.substrate).collect())
+        .unwrap_or_default();
+    let needs_kubernetes = substrates.is_empty()
+        || substrates
+            .iter()
+            .any(|s| !matches!(s, config::Substrate::DockerHost));
+    let needs_docker_host = substrates.is_empty()
+        || substrates
+            .iter()
+            .any(|s| matches!(s, config::Substrate::DockerHost));
 
     // docker: on PATH AND the daemon is reachable (a stopped daemon is the classic trap).
     if !on_path("docker") {
@@ -255,25 +273,41 @@ fn doctor() -> Result<()> {
         println!("  ✓ docker");
     }
 
-    // kubectl: presence is enough (it's tolerant of version skew).
-    if on_path("kubectl") {
-        println!("  ✓ kubectl");
-    } else {
-        println!("  ✗ kubectl (not found)");
-        problems.push("kubectl not on PATH".into());
+    // The reconciler on a compose host drives git and bash directly.
+    if needs_docker_host {
+        for tool in ["git", "bash"] {
+            if on_path(tool) {
+                println!("  ✓ {tool}");
+            } else {
+                println!("  ✗ {tool} (not found; needed by the docker-host substrate)");
+                problems.push(format!("{tool} not on PATH"));
+            }
+        }
     }
 
-    // tofu: on PATH AND >= MIN_TOFU (an older tofu fails confusingly mid-`up`).
-    match tofu_version() {
-        None => {
-            println!("  ✗ tofu (not found)");
-            problems.push("tofu not on PATH".into());
+    if needs_kubernetes {
+        // kubectl: presence is enough (it's tolerant of version skew).
+        if on_path("kubectl") {
+            println!("  ✓ kubectl");
+        } else {
+            println!("  ✗ kubectl (not found)");
+            problems.push("kubectl not on PATH".into());
         }
-        Some(v) if version_lt(&v, MIN_TOFU) => {
-            println!("  ✗ tofu {v} (need >= {MIN_TOFU})");
-            problems.push(format!("tofu {v} is older than {MIN_TOFU}"));
+
+        // tofu: on PATH AND >= MIN_TOFU (an older tofu fails confusingly mid-`up`).
+        match tofu_version() {
+            None => {
+                println!("  ✗ tofu (not found)");
+                problems.push("tofu not on PATH".into());
+            }
+            Some(v) if version_lt(&v, MIN_TOFU) => {
+                println!("  ✗ tofu {v} (need >= {MIN_TOFU})");
+                problems.push(format!("tofu {v} is older than {MIN_TOFU}"));
+            }
+            Some(v) => println!("  ✓ tofu ({v})"),
         }
-        Some(v) => println!("  ✓ tofu ({v})"),
+    } else {
+        println!("  · kubectl/tofu not checked (no Kubernetes substrate configured)");
     }
 
     if problems.is_empty() {

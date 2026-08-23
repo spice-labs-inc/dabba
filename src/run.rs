@@ -18,6 +18,36 @@ pub fn run(bin: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+/// Run with extra environment variables applied to the child only, inheriting
+/// stdout/stderr; error on non-zero exit.
+///
+/// A `None` value removes the variable from the child's environment instead of
+/// letting it be inherited — the difference matters when an unset variable is
+/// itself meaningful to the child (see `backend::docker::reconciler_environment`).
+/// Setting these on the child rather than on this process keeps the configuration
+/// out of global state, where it would otherwise outlive the call.
+pub fn run_with_environment(
+    bin: &str,
+    args: &[&str],
+    environment: &[(String, Option<String>)],
+) -> Result<()> {
+    let mut command = Command::new(bin);
+    command.args(args);
+    for (key, value) in environment {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+    let status = command
+        .status()
+        .with_context(|| format!("spawning {bin}"))?;
+    if !status.success() {
+        bail!("`{bin} {}` failed", args.join(" "));
+    }
+    Ok(())
+}
+
 /// Run with `input` written to stdin (so a secret travels via stdin, not the argv
 /// that `ps` / /proc exposes); inherit stdout/stderr; error on non-zero exit.
 pub fn run_stdin(bin: &str, args: &[&str], input: &str) -> Result<()> {
