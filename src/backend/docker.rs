@@ -439,3 +439,163 @@ fn print_up_summary(env_name: &str, gitops_dir: &Path, stacks_dir: &Path, backen
         kind = loop_kind(),
     );
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Exposure, Issuer, Substrate};
+
+    /// A resolved docker-host environment with the given substrateConfig.
+    fn environment(name: &str, substrate_config: &str) -> ResolvedEnv {
+        ResolvedEnv {
+            name: name.to_string(),
+            substrate: Substrate::DockerHost,
+            kubeconfig: None,
+            domain: "localtest.me".to_string(),
+            issuer: Issuer::Selfsigned,
+            exposure: Exposure::Nodeport,
+            acme_email: String::new(),
+            substrate_config: serde_yaml::from_str(substrate_config).unwrap(),
+        }
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dabba-docker-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn box_name_is_unset_unless_configured() {
+        assert_eq!(box_name(&environment("box1", "{}")), None);
+        assert_eq!(
+            box_name(&environment("box1", "{ boxName: alpha }")),
+            Some("alpha".to_string())
+        );
+        // Whitespace is not a box name; it must fall back to `hostname -s`.
+        assert_eq!(box_name(&environment("box1", "{ boxName: '  ' }")), None);
+    }
+
+    #[test]
+    fn apps_dir_defaults_to_apps() {
+        assert_eq!(apps_dir(&environment("box1", "{}")), "apps");
+        assert_eq!(
+            apps_dir(&environment("box1", "{ appsDir: deployments }")),
+            "deployments"
+        );
+    }
+
+    /// BOX_NAME must be REMOVED rather than inherited when unset: a stray BOX_NAME
+    /// in the invoking shell would otherwise point this box at another box's stacks.
+    #[test]
+    fn unset_box_name_is_removed_from_the_child_environment() {
+        let pairs = reconciler_environment(
+            &environment("box1", "{}"),
+            Path::new("/tmp/gitops"),
+            Path::new("/tmp/stacks"),
+        );
+        let box_name = pairs.iter().find(|(k, _)| k == "BOX_NAME").unwrap();
+        assert_eq!(box_name.1, None, "BOX_NAME must be removed, not inherited");
+    }
+
+    #[test]
+    fn reconciler_environment_carries_every_knob_the_loop_reads() {
+        let pairs = reconciler_environment(
+            &environment("box1", "{ boxName: alpha, appsDir: deployments }"),
+            Path::new("/tmp/gitops"),
+            Path::new("/tmp/stacks"),
+        );
+        let get = |key: &str| {
+            pairs
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("{key} is not passed to the reconciler"))
+                .1
+                .clone()
+        };
+        assert_eq!(get("GITOPS_DIR"), Some("/tmp/gitops".to_string()));
+        assert_eq!(get("STACKS_DIR"), Some("/tmp/stacks".to_string()));
+        assert_eq!(get("GITOPS_APPS_DIR"), Some("deployments".to_string()));
+        assert_eq!(get("BOX_NAME"), Some("alpha".to_string()));
+        // Without this the loop installs under the wrong scheduler identity.
+        assert_eq!(get("DABBA_ENVIRONMENT"), Some("box1".to_string()));
+    }
+
+    /// Two environments must never share a scheduler identity, or the second `up`
+    /// replaces the first one's loop and either `down` stops both.
+    #[test]
+    fn scheduler_identity_is_per_environment() {
+        assert_ne!(launchd_label("alpha"), launchd_label("beta"));
+        assert_ne!(systemd_timer("alpha"), systemd_timer("beta"));
+        assert!(launchd_label("alpha").ends_with(".alpha"));
+        assert!(systemd_timer("alpha").starts_with("gitops-reconcile-"));
+    }
+
+    /// These strings must match backends/docker/install.sh, which derives the same
+    /// names independently. A drift here means `status` cannot find a running loop.
+    #[test]
+    fn scheduler_identity_matches_the_install_script() {
+        let install = include_str!("../../backends/docker/install.sh");
+        assert!(
+            install.contains(r#"LABEL="io.spicelabs.dabba.reconcile.$DABBA_ENVIRONMENT""#),
+            "install.sh no longer derives the launchd label the way launchd_label does"
+        );
+        assert!(
+            install.contains(r#"UNIT_BASE="gitops-reconcile-$DABBA_ENVIRONMENT""#),
+            "install.sh no longer derives the unit name the way systemd_timer does"
+        );
+    }
+
+    #[test]
+    fn applied_apps_finds_only_directories_holding_a_compose_file() {
+        let dir = scratch("applied-apps");
+        std::fs::create_dir_all(dir.join("real")).unwrap();
+        std::fs::write(dir.join("real/docker-compose.yml"), "services: {}").unwrap();
+        std::fs::create_dir_all(dir.join("empty")).unwrap();
+        std::fs::write(dir.join("loose-file"), "not a stack").unwrap();
+
+        assert_eq!(applied_apps(&dir), vec!["real".to_string()]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn applied_apps_is_empty_when_nothing_has_been_applied() {
+        assert!(applied_apps(Path::new("/nonexistent/stacks")).is_empty());
+    }
+
+    /// With no backendDir configured the reconciler is materialised from the binary
+    /// — the path an installed dabba always takes, since it has no checkout.
+    #[test]
+    fn backend_dir_materialises_the_embedded_reconciler_by_default() {
+        let dir = scratch("materialise-default");
+        let resolved = docker_backend_dir(&environment("box1", "{}"), &dir).unwrap();
+        assert_eq!(resolved, dir.join("reconciler"));
+        for script in REQUIRED_SCRIPTS {
+            assert!(resolved.join(script).is_file(), "{script} missing");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backend_dir_rejects_a_configured_path_that_is_not_a_reconciler() {
+        let dir = scratch("bad-backend-dir");
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        let env = environment("box1", &format!("{{ backendDir: {} }}", empty.display()));
+        let error = docker_backend_dir(&env, &dir).unwrap_err().to_string();
+        assert!(
+            error.contains("does not look like backends/docker/"),
+            "got: {error}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn backend_dir_error_points_at_the_embedded_default() {
+        let dir = scratch("missing-backend-dir");
+        let env = environment("box1", "{ backendDir: /nonexistent/path }");
+        let error = docker_backend_dir(&env, &dir).unwrap_err().to_string();
+        assert!(error.contains("Leave it unset"), "got: {error}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}

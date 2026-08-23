@@ -18,6 +18,45 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
 
+  # The reconciler is bash, so it gets the same treatment the Rust gets: a linter
+  # that fails the build, and its tests run on every push rather than by hand.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck -S warning \
+            backends/docker/*.sh \
+            backends/docker/test/*.sh \
+            hack/*.sh \
+            hack/local-test/*.sh
+
+  # The reconciler's own tests. Unlike the quickstart e2e — which needs a kind
+  # cluster and public repos, and so runs on a schedule — this needs only the
+  # Docker the ubuntu runner already has, which is cheap enough to gate every
+  # pull request.
+  reconciler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: convergence and failure handling
+        run: bash backends/docker/test/run-convergence-test.sh
+      - name: deploy, no-op, redeploy
+        run: bash backends/docker/test/run-test.sh
+      - name: nothing was left running
+        if: always()
+        run: |
+          left="$(docker ps -aq --filter 'name=gitops-' | wc -l)"
+          if [ "$left" != "0" ]; then
+            echo "::error::the reconciler tests left $left container(s) behind"
+            docker ps -a --filter 'name=gitops-'
+            exit 1
+          fi
+          echo "no gitops-* containers left behind"
+
   # Dependency advisories, license policy, banned/duplicate crates, source allow-list.
   cargo-deny:
     runs-on: ubuntu-latest

@@ -71,3 +71,66 @@ pub fn select(config: &Path, env_name: Option<&str>) -> Result<Box<dyn Backend>>
         _ => Box::new(kubernetes::KubernetesBackend),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const CONFIG: &str = r#"
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: DabbaConfig
+metadata:
+  name: dabba
+spec:
+  domain: localtest.me
+  environments:
+    - { name: cluster, substrate: kind }
+    - { name: box, substrate: docker-host }
+"#;
+
+    fn config_file(test: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("dabba-select-{}-{}", std::process::id(), test));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dabba.yaml");
+        std::fs::write(&path, CONFIG).unwrap();
+        path
+    }
+
+    /// The dispatch that makes the whole trait worth having. Asserted by the side
+    /// each backend takes on a verb they answer differently: the docker backend has
+    /// no diagram, the Kubernetes one does.
+    #[test]
+    fn select_routes_each_substrate_to_its_own_backend() {
+        let config = config_file("routes");
+
+        let docker = select(&config, Some("box")).unwrap();
+        let error = docker
+            .diagram(&config, Some("box"), false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("not yet implemented for the docker backend"),
+            "docker-host did not select the DockerBackend; got: {error}"
+        );
+
+        // The Kubernetes backend answers diagram rather than refusing it, so any
+        // error it produces is about a missing cluster, not an unimplemented verb.
+        let kubernetes = select(&config, Some("cluster")).unwrap();
+        let result = kubernetes.diagram(&config, Some("cluster"), false);
+        if let Err(error) = result {
+            assert!(
+                !error.to_string().contains("not yet implemented"),
+                "kind selected the DockerBackend; got: {error}"
+            );
+        }
+
+        std::fs::remove_dir_all(config.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn select_fails_loudly_on_an_unknown_environment() {
+        let config = config_file("unknown-env");
+        assert!(select(&config, Some("nonexistent")).is_err());
+        std::fs::remove_dir_all(config.parent().unwrap()).ok();
+    }
+}
