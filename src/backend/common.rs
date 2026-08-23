@@ -135,3 +135,31 @@ pub fn show(config: &Path, env_name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+pub mod scratch {
+    use std::path::{Path, PathBuf};
+    /// A scratch directory that removes itself even when the test fails.
+    ///
+    /// Cleanup as the last line of a test only runs when the test passes, so a
+    /// failing test leaks its directory — which is exactly when you are running the
+    /// suite repeatedly. Drop runs during unwind, so this cleans up either way.
+    pub struct ScratchDirectory(pub PathBuf);
+
+    impl ScratchDirectory {
+        pub fn new(name: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("dabba-{name}-{}", std::process::id()));
+            std::fs::create_dir_all(&path).expect("creating a scratch directory");
+            ScratchDirectory(path)
+        }
+        pub fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDirectory {
+        fn drop(&mut self) {
+            std::fs::remove_dir_all(&self.0).ok();
+        }
+    }
+}

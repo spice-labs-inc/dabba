@@ -133,6 +133,7 @@ pub fn materialize(parent: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::common::scratch::ScratchDirectory;
 
     /// The embedded copies must be the real scripts, not empty or truncated. A
     /// silently empty asset would install a reconcile loop that does nothing.
@@ -193,7 +194,8 @@ mod tests {
 
     #[test]
     fn materialize_writes_an_executable_tree() {
-        let scratch = temporary_directory("materialize-writes");
+        let guard = ScratchDirectory::new("materialize-writes");
+        let scratch = guard.path().to_path_buf();
         let root = materialize(&scratch).unwrap();
 
         assert_eq!(root, scratch.join(RECONCILER_DIRECTORY_NAME));
@@ -214,14 +216,14 @@ mod tests {
                 );
             }
         }
-        std::fs::remove_dir_all(&scratch).ok();
     }
 
     /// Upgrading dabba must replace a stale script at the same path, so the
     /// installed unit picks the new content up without being reinstalled.
     #[test]
     fn materialize_repairs_a_stale_or_damaged_script() {
-        let scratch = temporary_directory("materialize-repairs");
+        let guard = ScratchDirectory::new("materialize-repairs");
+        let scratch = guard.path().to_path_buf();
         let root = materialize(&scratch).unwrap();
         let reconcile = root.join("reconcile.sh");
 
@@ -233,13 +235,13 @@ mod tests {
             restored.contains("GITOPS_DIR"),
             "a stale reconcile.sh was not rewritten"
         );
-        std::fs::remove_dir_all(&scratch).ok();
     }
 
     /// Re-running `up` on a converged environment must not rewrite files.
     #[test]
     fn materialize_leaves_current_files_untouched() {
-        let scratch = temporary_directory("materialize-idempotent");
+        let guard = ScratchDirectory::new("materialize-idempotent");
+        let scratch = guard.path().to_path_buf();
         let root = materialize(&scratch).unwrap();
         let reconcile = root.join("reconcile.sh");
         let before = std::fs::metadata(&reconcile).unwrap().modified().unwrap();
@@ -248,14 +250,5 @@ mod tests {
 
         let after = std::fs::metadata(&reconcile).unwrap().modified().unwrap();
         assert_eq!(before, after, "an unchanged script was rewritten");
-        std::fs::remove_dir_all(&scratch).ok();
-    }
-
-    /// A scratch directory keyed by name and process id, so concurrent test
-    /// binaries cannot collide.
-    fn temporary_directory(name: &str) -> PathBuf {
-        let base = std::env::temp_dir().join(format!("dabba-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&base).unwrap();
-        base
     }
 }

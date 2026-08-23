@@ -589,6 +589,7 @@ fn print_up_summary(env_name: &str, gitops_dir: &Path, stacks_dir: &Path, backen
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::common::scratch::ScratchDirectory;
     use crate::config::{Exposure, Issuer, Substrate};
 
     /// A resolved docker-host environment with the given substrateConfig.
@@ -603,12 +604,6 @@ mod tests {
             acme_email: String::new(),
             substrate_config: serde_yaml::from_str(substrate_config).unwrap(),
         }
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("dabba-docker-{name}-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     #[test]
@@ -709,14 +704,14 @@ mod tests {
 
     #[test]
     fn applied_apps_finds_only_directories_holding_a_compose_file() {
-        let dir = scratch("applied-apps");
+        let guard = ScratchDirectory::new("docker-applied-apps");
+        let dir = guard.path().to_path_buf();
         std::fs::create_dir_all(dir.join("real")).unwrap();
         std::fs::write(dir.join("real/docker-compose.yml"), "services: {}").unwrap();
         std::fs::create_dir_all(dir.join("empty")).unwrap();
         std::fs::write(dir.join("loose-file"), "not a stack").unwrap();
 
         assert_eq!(applied_apps(&dir), vec!["real".to_string()]);
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -728,18 +723,19 @@ mod tests {
     /// — the path an installed dabba always takes, since it has no checkout.
     #[test]
     fn backend_dir_materialises_the_embedded_reconciler_by_default() {
-        let dir = scratch("materialise-default");
+        let guard = ScratchDirectory::new("docker-materialise-default");
+        let dir = guard.path().to_path_buf();
         let resolved = docker_backend_dir(&environment("box1", "{}"), &dir).unwrap();
         assert_eq!(resolved, dir.join("reconciler"));
         for script in REQUIRED_SCRIPTS {
             assert!(resolved.join(script).is_file(), "{script} missing");
         }
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn backend_dir_rejects_a_configured_path_that_is_not_a_reconciler() {
-        let dir = scratch("bad-backend-dir");
+        let guard = ScratchDirectory::new("docker-bad-backend-dir");
+        let dir = guard.path().to_path_buf();
         let empty = dir.join("empty");
         std::fs::create_dir_all(&empty).unwrap();
         let env = environment("box1", &format!("{{ backendDir: {} }}", empty.display()));
@@ -748,7 +744,6 @@ mod tests {
             error.contains("does not look like backends/docker/"),
             "got: {error}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The path is interpolated into a shell command inside the container, so a
@@ -785,10 +780,10 @@ mod tests {
 
     #[test]
     fn backend_dir_error_points_at_the_embedded_default() {
-        let dir = scratch("missing-backend-dir");
+        let guard = ScratchDirectory::new("docker-missing-backend-dir");
+        let dir = guard.path().to_path_buf();
         let env = environment("box1", "{ backendDir: /nonexistent/path }");
         let error = docker_backend_dir(&env, &dir).unwrap_err().to_string();
         assert!(error.contains("Leave it unset"), "got: {error}");
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
