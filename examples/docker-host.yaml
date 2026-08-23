@@ -1,0 +1,53 @@
+# A bare-OS box that runs docker compose instead of Kubernetes.
+#
+# The reconcile loop pulls the gitops repository every minute and converges this
+# box's compose stacks to it — the Flux equivalent for a machine with no cluster.
+# Bring it up with:
+#
+#     dabba env box up -c examples/docker-host.yaml --gitops-seed <path-or-url>
+#
+# What this substrate does NOT share with the Kubernetes ones is worth knowing
+# before you pick it. `spec.tls`, `spec.gateway`, `spec.observability` and
+# `spec.useCases` drive the Kubernetes reconcile layer and are not consumed here,
+# so they are deliberately absent below rather than set and ignored. Gitops
+# content is not portable either: a compose host consumes
+# `apps/<box>/<app>/docker-compose.yml`, not kustomizations and HelmReleases.
+#
+# What IS portable is the application definition. Write one Application and
+# render it for either substrate:
+#
+#     dabba application render app.yaml --substrate docker-host
+#     dabba application render app.yaml --substrate kind
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: DabbaConfig
+metadata:
+  name: dabba
+spec:
+  domain: localtest.me
+
+  git:
+    # The gitops repository this box converges from. --gitops-seed overrides it.
+    upstream: ""
+
+  defaultEnvironment: box
+
+  environments:
+    - name: box
+      substrate: docker-host
+      substrateConfig:
+        # This box's directory in the gitops repository. Unset means `hostname -s`,
+        # which is convenient on a laptop and a trap on a fleet where two machines
+        # can end up sharing a short hostname — set it explicitly in production.
+        boxName: box
+
+        # The apps subtree under the gitops repository. Default `apps`.
+        # appsDir: apps
+
+        # The branch this box tracks. Default `main`. A branch that does not exist
+        # is a terminal error on the first tick rather than a silent no-op.
+        # gitopsBranch: main
+
+        # A working copy of backends/docker/ to drive instead of the reconciler
+        # compiled into this binary. For developing the reconciler itself; leave
+        # unset in normal use.
+        # backendDir: /path/to/dabba/backends/docker
