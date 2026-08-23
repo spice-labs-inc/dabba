@@ -1544,6 +1544,9 @@ fn substrate_dir(s: Substrate) -> Result<&'static str> {
         Substrate::ScalewayKapsule => bail!("the scaleway substrate (Tier 1) is not built yet"),
         // Existing is handled before this is called (no provisioning module).
         Substrate::Existing => bail!("existing substrate has no provisioning module"),
+        // Unreachable on the k8s path: a docker-host env dispatches to the
+        // DockerBackend (see backend::select) and never enters this flow.
+        Substrate::DockerHost => bail!("docker-host is served by the docker backend, not tofu"),
     })
 }
 

@@ -94,6 +94,22 @@ pub enum Substrate {
     Eks,
     /// Bring-your-own: skip provisioning and configure the cluster `kubeconfig` points at.
     Existing,
+    /// A bare-OS host that runs `docker compose` instead of Kubernetes. Selects the
+    /// `DockerBackend` (the gitops reconciler under `backends/docker/`) rather than
+    /// the tofu/Flux `KubernetesBackend`.
+    ///
+    /// NOTE ON THE SELECTOR SHAPE. The reconciler README sketched a separate
+    /// `runtime: kubernetes | docker` field alongside `substrate:`. We fold the
+    /// choice into `substrate` instead — as a new `docker-host` value — because it
+    /// is the single-source-of-truth design: `substrate` already IS "what this env
+    /// runs on", and one field makes contradictory states (e.g. `runtime: docker`
+    /// with `substrate: eks`) unrepresentable, so no cross-field validation is
+    /// needed. It also keeps `ResolvedEnv.substrate` a plain (non-optional)
+    /// `Substrate`, so none of the k8s code that matches on it has to learn about an
+    /// orthogonal runtime — the backend is picked by the substrate alone. The k8s
+    /// path never receives this variant (the `DockerBackend` is dispatched first),
+    /// so the k8s substrate handling is behavior-preserving.
+    DockerHost,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -505,6 +521,22 @@ spec:
             cfg.resolve(Some("byo")).unwrap().substrate,
             Substrate::Existing
         );
+    }
+
+    #[test]
+    fn parses_and_resolves_docker_host() {
+        // A docker-host env parses, validates (domain inherited from spec), and
+        // resolves with substrate=DockerHost — the selector the DockerBackend keys on.
+        let cfg_text = LOCAL.replace(
+            "- { name: minikube, substrate: minikube }",
+            "- { name: box1, substrate: docker-host, substrateConfig: { boxName: testbox } }",
+        );
+        let cfg: DabbaConfig = serde_yaml::from_str(&cfg_text).unwrap();
+        cfg.validate().unwrap();
+        let env = cfg.resolve(Some("box1")).unwrap();
+        assert_eq!(env.substrate, Substrate::DockerHost);
+        assert_eq!(env.substrate_str("boxName", ""), "testbox");
+        assert_eq!(env.domain, "localtest.me"); // inherited from spec.domain
     }
 
     #[test]
