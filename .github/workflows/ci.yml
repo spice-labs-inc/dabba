@@ -150,6 +150,19 @@ jobs:
               || { echo "::error::$f is not a valid compose file"; exit 1; }
           done
 
+  # The pinned environment is only real if something checks it. This checks the
+  # half that does not need the toolchain installed: that every Application tag
+  # and every hand-written compose stack agrees with spec.environment.services.
+  pinned-environment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: shipped artifacts agree with the pinned service versions
+        run: ./target/release/dabba environment verify -c examples/local.yaml
+
   # Dependency advisories, license policy, banned/duplicate crates, source allow-list.
   cargo-deny:
     runs-on: ubuntu-latest

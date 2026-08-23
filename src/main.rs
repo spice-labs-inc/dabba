@@ -14,6 +14,7 @@ mod backend;
 mod cache;
 mod config;
 mod edit;
+mod environment;
 mod render;
 mod run;
 
@@ -91,6 +92,11 @@ enum Command {
     },
     /// Preflight checks (docker / tools / cluster reachable)
     Doctor,
+    /// The pinned toolchain and service versions, and whether this machine matches
+    Environment {
+        #[command(subcommand)]
+        action: EnvironmentAction,
+    },
     /// The shared CI build cache: its bucket and two scoped credentials
     Cache {
         #[command(subcommand)]
@@ -148,6 +154,22 @@ enum SecretAction {
     Ls { path: Option<String> },
     /// Show a secret's value, e.g. `dabba/forgejo` or `local/openbao-root`
     Get { name: String },
+}
+
+#[derive(Subcommand)]
+enum EnvironmentAction {
+    /// Print the pins and how this machine compares
+    Show,
+    /// Exit non-zero if this machine does not match the pins
+    Check,
+    /// Print the pins as shell exports, for a workflow or shell to eval
+    Export,
+    /// Report Application definitions whose tag disagrees with a service pin
+    Verify {
+        /// Directory of Application definitions
+        #[arg(default_value = "examples/applications")]
+        directory: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -223,6 +245,44 @@ fn main() -> Result<()> {
             }
         },
         Command::Doctor => doctor(&cfg),
+        Command::Environment { action } => {
+            let parsed = DabbaConfig::load(&cfg)?;
+            match action {
+                EnvironmentAction::Show => environment::show(&parsed.spec.environment),
+                EnvironmentAction::Check => environment::check(&parsed.spec.environment),
+                EnvironmentAction::Export => environment::export(&parsed.spec.environment),
+                EnvironmentAction::Verify { directory } => {
+                    let applications = environment::load_applications(&directory)?;
+                    let mut problems = environment::check_application_versions(
+                        &parsed.spec.environment,
+                        &applications,
+                    );
+                    // Hand-written compose stacks carry pinned images too; the
+                    // reconciler still accepts them, so a pin that only reached
+                    // rendered artifacts would miss the stack it was written for.
+                    let compose =
+                        environment::load_compose_files(Path::new("backends")).unwrap_or_default();
+                    problems.extend(environment::check_compose_versions(
+                        &parsed.spec.environment,
+                        &compose,
+                    ));
+
+                    if problems.is_empty() {
+                        println!(
+                            "✓ {} definition(s) and {} compose stack(s) agree with the \
+                             pinned service versions",
+                            applications.len(),
+                            compose.len()
+                        );
+                        return Ok(());
+                    }
+                    for problem in &problems {
+                        println!("  ≠ {problem}");
+                    }
+                    anyhow::bail!("{} disagreement(s) with the pin", problems.len())
+                }
+            }
+        }
         Command::Cache { action } => match action {
             CacheAction::Up => cache::up(&cfg, None),
             CacheAction::Credentials { scope } => {

@@ -63,6 +63,14 @@ pub struct Spec {
     pub alerting: Alerting, // [R]
     #[serde(default)]
     pub use_cases: Vec<String>, // [R]
+    /// The pinned environment: toolchain and service versions that a laptop, CI
+    /// and the cloud all resolve to. Consumed by `dabba environment`, not by any
+    /// substrate — a pin that varied per environment would not be a pin.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::environment::Environment::is_empty"
+    )]
+    pub environment: crate::environment::Environment,
 }
 
 /// One environment: a named managed boundary. The `name` is its identity — it is

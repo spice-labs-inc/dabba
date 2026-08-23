@@ -154,6 +154,24 @@ environments:
     substrate: scaleway-kapsule
 ```
 
+## The same versions everywhere
+
+"The same thing everywhere" is only true if something decides what the same thing
+*is*. `spec.environment` pins the toolchain a build needs and the versions of the
+services the platform runs:
+
+```bash
+dabba environment show     # the pins, and how this machine compares
+dabba environment check    # exits non-zero on drift
+dabba environment verify   # artifacts whose tags disagree with a service pin
+```
+
+Service versions are **not** restated in the pin — they already live in the tag of
+an Application or the `image:` line of a compose stack. Restating them would make
+two lists maintained by different hands, which is the bug this codebase has
+produced most often. The pin is the authority and `verify` reports anything that
+disagrees, so drift is caught rather than duplicated.
+
 ## How it fits together
 
 ```
