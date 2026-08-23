@@ -1541,7 +1541,7 @@ fn substrate_dir(s: Substrate) -> Result<&'static str> {
         Substrate::K3d => "k3d",
         Substrate::Minikube => "minikube",
         Substrate::Eks => "eks-fargate",
-        Substrate::ScalewayKapsule => bail!("the scaleway substrate (Tier 1) is not built yet"),
+        Substrate::ScalewayKapsule => "scaleway-kapsule",
         // Existing is handled before this is called (no provisioning module).
         Substrate::Existing => bail!("existing substrate has no provisioning module"),
         // Unreachable on the k8s path: a docker-host env dispatches to the
@@ -1555,6 +1555,7 @@ fn substrate_dir(s: Substrate) -> Result<&'static str> {
 fn cluster_stage(s: Substrate) -> &'static str {
     match s {
         Substrate::Eks => "01-cluster-eks",
+        Substrate::ScalewayKapsule => "01-cluster-scaleway",
         _ => "01-cluster",
     }
 }
@@ -1586,6 +1587,44 @@ fn cluster_vars(env: &ResolvedEnv) -> Vec<String> {
         v.push(format!(
             "-var=public_subnet_ids={}",
             hcl_list(&env.substrate_list("publicSubnetIds"))
+        ));
+    }
+    if env.substrate == Substrate::ScalewayKapsule {
+        v.push(format!(
+            "-var=region={}",
+            env.substrate_str("region", "fr-par")
+        ));
+        // The pool's zone must sit inside the cluster's region. Scaleway rejects a
+        // mismatch at apply rather than at plan, so a wrong pair costs a failed
+        // provisioning run rather than a fast error.
+        v.push(format!(
+            "-var=zone={}",
+            env.substrate_str("zone", "fr-par-1")
+        ));
+        v.push(format!(
+            "-var=k8s_version={}",
+            env.substrate_str("k8sVersion", "1.31")
+        ));
+        v.push(format!(
+            "-var=node_type={}",
+            env.substrate_str("nodeType", "PRO2-XXS")
+        ));
+        v.push(format!(
+            "-var=node_count={}",
+            env.substrate_str("nodeCount", "2")
+        ));
+        v.push(format!(
+            "-var=autoscaling={}",
+            env.substrate_str("autoscaling", "false")
+        ));
+        v.push(format!(
+            "-var=max_node_count={}",
+            env.substrate_str("maxNodeCount", "4")
+        ));
+        // Empty provisions a dedicated private network; Kapsule requires one.
+        v.push(format!(
+            "-var=private_network_id={}",
+            env.substrate_str("privateNetworkId", "")
         ));
     }
     v
@@ -1681,4 +1720,145 @@ fn now_secs() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Exposure, Issuer};
+
+    fn environment(substrate: Substrate, substrate_config: &str) -> ResolvedEnv {
+        ResolvedEnv {
+            name: "cloud".to_string(),
+            substrate,
+            kubeconfig: None,
+            domain: "example.test".to_string(),
+            issuer: Issuer::Selfsigned,
+            exposure: Exposure::Nodeport,
+            acme_email: String::new(),
+            substrate_config: serde_yaml::from_str(substrate_config).unwrap(),
+        }
+    }
+
+    /// Every variable a 01-cluster stage DECLARES must actually be passed by
+    /// cluster_vars, or the knob exists in the template and nothing ever sets it.
+    ///
+    /// This is the third outing for this pattern. `appsDir` was honoured by the
+    /// installer and dropped by the unit templates; OPENBAO_TOKEN_FILE reached
+    /// install.sh and not the scheduled ticks. Both looked like working
+    /// configuration and did nothing. Two independent derivations of the same list
+    /// need a test that they agree, every time.
+    fn declared_variables(stage: &str) -> Vec<String> {
+        stage
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("variable \"")?;
+                let name = rest.split('"').next()?;
+                Some(name.to_string())
+            })
+            .collect()
+    }
+
+    fn passed_variables(env: &ResolvedEnv) -> Vec<String> {
+        cluster_vars(env)
+            .iter()
+            .filter_map(|arg| {
+                let rest = arg.strip_prefix("-var=")?;
+                Some(rest.split('=').next()?.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_scaleway_stage_variable_is_passed() {
+        let stage = include_str!("../../quickstart/01-cluster-scaleway/main.tf");
+        let env = environment(Substrate::ScalewayKapsule, "{}");
+        let passed = passed_variables(&env);
+        for declared in declared_variables(stage) {
+            assert!(
+                passed.contains(&declared),
+                "quickstart/01-cluster-scaleway declares `{declared}` but cluster_vars \
+                 never passes it, so the knob would silently take its template default"
+            );
+        }
+    }
+
+    #[test]
+    fn every_eks_stage_variable_is_passed() {
+        let stage = include_str!("../../quickstart/01-cluster-eks/main.tf");
+        let env = environment(Substrate::Eks, "{}");
+        let passed = passed_variables(&env);
+        for declared in declared_variables(stage) {
+            assert!(
+                passed.contains(&declared),
+                "quickstart/01-cluster-eks declares `{declared}` but cluster_vars never \
+                 passes it"
+            );
+        }
+    }
+
+    /// And the inverse: a variable passed to a stage that does not declare it is a
+    /// hard tofu error at apply time, which is a slow way to find a typo.
+    #[test]
+    fn no_variable_is_passed_that_the_stage_does_not_declare() {
+        for (substrate, stage) in [
+            (
+                Substrate::ScalewayKapsule,
+                include_str!("../../quickstart/01-cluster-scaleway/main.tf"),
+            ),
+            (
+                Substrate::Eks,
+                include_str!("../../quickstart/01-cluster-eks/main.tf"),
+            ),
+            (
+                Substrate::Kind,
+                include_str!("../../quickstart/01-cluster/main.tf"),
+            ),
+        ] {
+            let declared = declared_variables(stage);
+            let env = environment(substrate, "{}");
+            for passed in passed_variables(&env) {
+                assert!(
+                    declared.contains(&passed),
+                    "{substrate:?} passes `-var={passed}` but its stage does not declare \
+                     it; tofu rejects that at apply"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scaleway_selects_its_own_module_and_stage() {
+        assert_eq!(
+            substrate_dir(Substrate::ScalewayKapsule).unwrap(),
+            "scaleway-kapsule"
+        );
+        assert_eq!(
+            cluster_stage(Substrate::ScalewayKapsule),
+            "01-cluster-scaleway"
+        );
+        // It is a cloud substrate, so the teardown path removes cloud load
+        // balancers and DNS records before destroying the cluster.
+        assert!(is_cloud(Substrate::ScalewayKapsule));
+    }
+
+    #[test]
+    fn scaleway_config_overrides_reach_the_stage() {
+        let env = environment(
+            Substrate::ScalewayKapsule,
+            "{ region: nl-ams, zone: nl-ams-2, nodeType: GP1-XS, nodeCount: '5' }",
+        );
+        let vars = cluster_vars(&env);
+        assert!(vars.contains(&"-var=region=nl-ams".to_string()));
+        assert!(vars.contains(&"-var=zone=nl-ams-2".to_string()));
+        assert!(vars.contains(&"-var=node_type=GP1-XS".to_string()));
+        assert!(vars.contains(&"-var=node_count=5".to_string()));
+    }
+
+    /// A local substrate must not pick up cloud knobs it has no variables for.
+    #[test]
+    fn local_substrates_pass_only_the_cluster_name() {
+        let env = environment(Substrate::Kind, "{ region: nl-ams }");
+        assert_eq!(cluster_vars(&env), vec!["-var=cluster_name=cloud"]);
+    }
 }
