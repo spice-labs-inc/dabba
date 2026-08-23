@@ -33,7 +33,7 @@
 //! SEAM for a later increment (deliberately not built here): `diagram` for compose
 //! topology. `dabba status` covers the same ground in text.
 
-use crate::backend::common::{env_workdir, expand_tilde, log, on_path, read_stash};
+use crate::backend::common::{env_workdir, expand_tilde, log, on_path, read_stash, write_stash};
 use crate::backend::reconciler_assets::{self, REQUIRED_SCRIPTS};
 use crate::backend::{Backend, DownOptions, Options};
 use crate::config::{DabbaConfig, ResolvedEnv};
@@ -210,6 +210,223 @@ fn openbao_container() -> Result<String> {
     Ok(id)
 }
 
+/// How long to wait for the reconcile loop to converge the OpenBao stack before
+/// giving up. The first tick has to pull the image, so this is deliberately
+/// generous: 60 attempts at 5s is five minutes.
+const OPENBAO_WAIT_ATTEMPTS: usize = 60;
+
+/// Does this box's gitops content declare an OpenBao stack?
+///
+/// Checked rather than inferred from whether a container turns up, so a box that
+/// simply has no secret store is not punished with a five-minute wait, and a box
+/// that DOES declare one gets a real error instead of silently skipping
+/// initialisation.
+fn openbao_declared(gitops_dir: &Path, apps_dir: &str, box_directory: &str) -> bool {
+    let stack = gitops_dir
+        .join(apps_dir)
+        .join(box_directory)
+        .join("openbao");
+    stack.join("docker-compose.yml").is_file()
+        || stack.join("docker-compose.override.yml").is_file()
+}
+
+/// The box's directory name in the gitops repo: the configured `boxName`, else
+/// `hostname -s`, matching the reconciler's own default.
+fn box_directory(env: &ResolvedEnv) -> String {
+    box_name(env).unwrap_or_else(|| {
+        run::capture("hostname", &["-s"])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether OpenBao has been initialised, and whether it is currently sealed.
+struct OpenbaoStatus {
+    initialized: bool,
+    sealed: bool,
+}
+
+/// `bao status`, parsed.
+///
+/// The exit code carries state rather than failure here — 2 means sealed — so the
+/// output is captured regardless of it. JSON is a subset of YAML, so the parser
+/// already in the dependency tree reads it without pulling in another one.
+fn openbao_status() -> Result<OpenbaoStatus> {
+    let container = openbao_container()?;
+    let output = run::capture_including_failures(
+        "docker",
+        &[
+            "exec",
+            &container,
+            "sh",
+            "-c",
+            "BAO_ADDR=http://127.0.0.1:8200 bao status -format=json",
+        ],
+    )
+    .unwrap_or_default();
+
+    let value: serde_yaml::Value = serde_yaml::from_str(&output)
+        .with_context(|| format!("parsing `bao status` output: {output:?}"))?;
+    let flag = |key: &str| value.get(key).and_then(|v| v.as_bool());
+    Ok(OpenbaoStatus {
+        initialized: flag("initialized").unwrap_or(false),
+        sealed: flag("sealed").unwrap_or(true),
+    })
+}
+
+/// Make sure OpenBao is initialised and unsealed, if this box declares one.
+///
+/// File storage — which the example stack uses, because a dev-mode server loses
+/// every secret on restart — means a fresh server comes up SEALED and stays that
+/// way until something unseals it. That something is this.
+///
+/// Idempotent by construction: it initialises only a vault that reports itself
+/// uninitialised, so re-running `up` against a vault holding real data unseals it
+/// and never re-initialises it. Re-initialising would orphan every existing
+/// secret behind a key nobody has.
+fn ensure_openbao_ready(env: &ResolvedEnv, workdir: &Path, gitops_dir: &Path) -> Result<()> {
+    if !openbao_declared(gitops_dir, &apps_dir(env), &box_directory(env)) {
+        return Ok(());
+    }
+
+    log(&format!(
+        "[{}] waiting for the reconcile loop to bring up OpenBao",
+        env.name
+    ));
+    run::wait_for(
+        "the openbao stack to be running (the loop converges it within a minute, \
+         plus however long the image pull takes)",
+        OPENBAO_WAIT_ATTEMPTS,
+        || openbao_container().is_ok(),
+    )?;
+
+    // The server may be listening before it can answer; a failed status read is
+    // not yet a failure.
+    let mut status = openbao_status();
+    for _ in 0..12 {
+        if status.is_ok() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        status = openbao_status();
+    }
+    let status = status?;
+
+    if !status.initialized {
+        initialize_openbao(env, workdir)?;
+    } else if status.sealed {
+        unseal_openbao(env, workdir)?;
+    } else {
+        log(&format!("[{}] OpenBao is already unsealed", env.name));
+    }
+    Ok(())
+}
+
+/// Initialise a fresh vault and stash what comes back.
+///
+/// One key share, threshold one. Splitting the key into shares is meaningful when
+/// the shares go to different people or systems; here every share would land in
+/// the same directory on the same box, which buys no security and adds ways for
+/// an unattended restart to fail. This is stated so its absence reads as a
+/// decision rather than an oversight.
+///
+/// The unseal key and root token exist exactly once, in this output. They are
+/// written before anything else can fail, because they cannot be recovered.
+fn initialize_openbao(env: &ResolvedEnv, workdir: &Path) -> Result<()> {
+    log(&format!("[{}] initialising OpenBao (first run)", env.name));
+    let container = openbao_container()?;
+    let output = run::capture(
+        "docker",
+        &[
+            "exec",
+            &container,
+            "sh",
+            "-c",
+            "BAO_ADDR=http://127.0.0.1:8200 bao operator init \
+             -key-shares=1 -key-threshold=1 -format=json",
+        ],
+    )
+    .context("running `bao operator init`")?;
+
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(&output).context("parsing `bao operator init` output")?;
+    let unseal_key = value
+        .get("unseal_keys_b64")
+        .and_then(|v| v.as_sequence())
+        .and_then(|s| s.first())
+        .and_then(|v| v.as_str())
+        .context("no unseal key in `bao operator init` output")?;
+    let root_token = value
+        .get("root_token")
+        .and_then(|v| v.as_str())
+        .context("no root token in `bao operator init` output")?;
+
+    // Stash before unsealing: if unsealing fails we must still hold the key, or
+    // the vault is permanently unopenable.
+    write_stash(workdir, OPENBAO_UNSEAL_KEY, unseal_key)?;
+    write_stash(workdir, OPENBAO_ROOT_TOKEN, root_token)?;
+
+    unseal_openbao(env, workdir)?;
+
+    // The kv v2 mount the secret verbs and the reconciler both address as
+    // `secret/...`. Enabling it here means a freshly initialised box can resolve
+    // references immediately rather than on whatever tick someone remembers.
+    openbao(
+        root_token,
+        "bao secrets enable -path=secret kv-v2 2>/dev/null || true",
+    )?;
+
+    log(&format!(
+        "[{}] OpenBao initialised; unseal key and root token are in {} (0600)",
+        env.name,
+        workdir.display()
+    ));
+    Ok(())
+}
+
+fn unseal_openbao(env: &ResolvedEnv, workdir: &Path) -> Result<()> {
+    let key = read_stash(workdir, OPENBAO_UNSEAL_KEY);
+    if key.is_empty() {
+        bail!(
+            "OpenBao for env {:?} is sealed and dabba has no unseal key for it. \
+             The key is written to {} on first initialisation and cannot be \
+             recovered from the vault it opens; restore it from your backup.",
+            env.name,
+            workdir.join(OPENBAO_UNSEAL_KEY).display()
+        );
+    }
+    log(&format!("[{}] unsealing OpenBao", env.name));
+    let container = openbao_container()?;
+    // The key crosses to the container on stdin and is only then placed in the
+    // command line, INSIDE the container.
+    //
+    // `bao operator unseal -` looks like it should read the key from stdin — that
+    // is what `vault operator unseal -` does — but OpenBao 2.x does not implement
+    // it, and rejects the empty read with "'key' must be a valid hex or base64
+    // string", an error about the key that is really about the plumbing. Verified
+    // directly: stdin fails, an argument succeeds.
+    //
+    // So the key must be an argument, and the question is only whose process list
+    // it lands in. Read from stdin by the shell inside the container, it never
+    // appears in the host's `ps` — which shows only this `docker exec` line. It is
+    // briefly visible to a process inside the OpenBao container itself, which is
+    // an acceptable residual: anything able to read that container's process list
+    // can already read the vault's storage directly.
+    run::run_stdin(
+        "docker",
+        &[
+            "exec",
+            "-i",
+            &container,
+            "sh",
+            "-c",
+            "read -r KEY; BAO_ADDR=http://127.0.0.1:8200 exec bao operator unseal \"$KEY\"",
+        ],
+        &format!("{key}\n"),
+    )
+    .context("unsealing OpenBao")
+}
+
 /// Run a `bao` command inside the OpenBao container, token on stdin.
 ///
 /// The token never appears in argv, which `ps` and /proc expose to every process on
@@ -264,6 +481,10 @@ fn up(opts: &Options) -> Result<()> {
         &[install_str.as_ref()],
         &reconciler_environment(&env, &gitops_dir, &stacks_dir, &workdir),
     )?;
+
+    // The loop is installed; OpenBao, if this box has one, still needs to be
+    // initialised and unsealed before any stack's secret references can resolve.
+    ensure_openbao_ready(&env, &workdir, &gitops_dir)?;
 
     print_up_summary(&env.name, &gitops_dir, &stacks_dir, &backend_dir);
     Ok(())
@@ -687,6 +908,49 @@ mod tests {
         assert!(systemd_timer("alpha").starts_with("gitops-reconcile-"));
     }
 
+    /// Every variable the reconciler is configured with must survive into the
+    /// SCHEDULED ticks, not just the install-time pass.
+    ///
+    /// This has now gone wrong twice. `appsDir` was honoured by install.sh and
+    /// dropped by the unit templates, so the knob appeared to work and did
+    /// nothing. Then OPENBAO_TOKEN_FILE was added to the child environment and not
+    /// to the templates, so every tick after the first reported that no token was
+    /// available. install.sh already fails on an unrendered token, but nothing
+    /// caught a variable that was never put in a template at all — which is this.
+    #[test]
+    fn every_configured_variable_survives_into_the_scheduled_ticks() {
+        let launchd = include_str!(
+            "../../backends/docker/launchd/io.spicelabs.dabba.reconcile.plist.template"
+        );
+        let systemd =
+            include_str!("../../backends/docker/systemd/gitops-reconcile.service.template");
+
+        let pairs = reconciler_environment(
+            &environment("box1", "{}"),
+            Path::new("/tmp/gitops"),
+            Path::new("/tmp/stacks"),
+            Path::new("/tmp/workdir"),
+        );
+
+        for (key, _) in &pairs {
+            // Match the ASSIGNMENT, not the name anywhere in the file. A plain
+            // substring check passes on a variable that survives only in a
+            // comment, which reaches no child process — exactly the failure this
+            // test exists to catch.
+            assert!(
+                launchd.contains(&format!("<key>{key}</key>")),
+                "{key} is passed to install.sh but is not set in the launchd \
+                 template EnvironmentVariables, so the scheduled ticks would \
+                 never see it"
+            );
+            assert!(
+                systemd.contains(&format!("Environment={key}=")),
+                "{key} is passed to install.sh but has no Environment= line in \
+                 the systemd template, so the scheduled ticks would never see it"
+            );
+        }
+    }
+
     /// These strings must match backends/docker/install.sh, which derives the same
     /// names independently. A drift here means `status` cannot find a running loop.
     #[test]
@@ -700,6 +964,56 @@ mod tests {
             install.contains(r#"UNIT_BASE="gitops-reconcile-$DABBA_ENVIRONMENT""#),
             "install.sh no longer derives the unit name the way systemd_timer does"
         );
+    }
+
+    /// The reconciler boots LaunchAgents in and out by `gui/<uid>/<label>`, and it
+    /// derives that label from the FILENAME. A plist whose declared `Label`
+    /// disagrees installs once and can then never be updated or removed, so it
+    /// outlives its own deletion from git.
+    ///
+    /// The shipped example is what people copy, so it is the one file that must
+    /// not get this wrong. It did: it was named `example-cron.plist` while
+    /// declaring `io.spicelabs.dabba.cron.example-app.nightly-backup`, and the
+    /// macOS cron test could not catch it because that test generates its fixture
+    /// with the filename and the Label from the same variable.
+    #[test]
+    fn shipped_launchd_examples_declare_a_label_matching_their_filename() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/docker/examples");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("reading the examples directory") {
+            let path = entry.expect("an examples directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("plist") {
+                continue;
+            }
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .expect("a plist filename")
+                .to_string();
+            let body = std::fs::read_to_string(&path).expect("reading the plist");
+            let declared = label_in_plist(&body)
+                .unwrap_or_else(|| panic!("{stem}.plist declares no Label at all"));
+            assert_eq!(
+                declared, stem,
+                "{stem}.plist declares Label {declared:?}; the reconciler manages \
+                 agents by filename, so an example that disagrees teaches people to \
+                 write an agent it can never remove"
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > 0,
+            "no example plists were found, so this test would pass vacuously"
+        );
+    }
+
+    /// The `<string>` following `<key>Label</key>`, mirroring what the reconciler's
+    /// sed does at runtime.
+    fn label_in_plist(body: &str) -> Option<String> {
+        let after = body.split_once("<key>Label</key>")?.1;
+        let open = after.find("<string>")? + "<string>".len();
+        let close = after[open..].find("</string>")? + open;
+        Some(after[open..close].trim().to_string())
     }
 
     #[test]

@@ -38,6 +38,8 @@ BOX_NAME="${BOX_NAME:-$(hostname -s)}"
 GITOPS_APPS_DIR="${GITOPS_APPS_DIR:-apps}"
 GITOPS_BRANCH="${GITOPS_BRANCH:-main}"
 DABBA_ENVIRONMENT="${DABBA_ENVIRONMENT:-default}"
+OPENBAO_PROJECT="${OPENBAO_PROJECT:-gitops-openbao}"
+OPENBAO_TOKEN_FILE="${OPENBAO_TOKEN_FILE:-}"
 PLATFORM="$(uname -s)"
 
 # Scheduler identity, per environment. Kept in one place so install.sh,
@@ -66,6 +68,8 @@ render() {
         -e "s|__GITOPS_APPS_DIR__|$GITOPS_APPS_DIR|g" \
         -e "s|__GITOPS_BRANCH__|$GITOPS_BRANCH|g" \
         -e "s|__DABBA_ENVIRONMENT__|$DABBA_ENVIRONMENT|g" \
+        -e "s|__OPENBAO_PROJECT__|$OPENBAO_PROJECT|g" \
+        -e "s|__OPENBAO_TOKEN_FILE__|$OPENBAO_TOKEN_FILE|g" \
         -e "s|__LABEL__|$LABEL|g" \
         -e "s|__UNIT_BASE__|$UNIT_BASE|g" \
         -e "s|__PATH__|$PATH|g" \

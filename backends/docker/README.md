@@ -168,27 +168,112 @@ id), and changing the compose triggered exactly one redeploy (new id, new label)
 
 ## How this slots into dabba
 
-Today dabba (`src/`) provisions Kubernetes **substrates** (`kind`/`k3d`/`eks`/…)
-and lets Flux reconcile. The DockerBackend is the parallel path for compose
-hosts. The seam for the forthcoming increment:
+`src/backend/` dispatches dabba's per-environment verbs through a `Backend`
+trait. The Kubernetes flow (tofu provisions a substrate, Flux reconciles the
+platform) is one implementation; `DockerBackend` is the other, and it drives this
+directory.
 
-- **`Backend` trait (next increment, not built here).** dabba's `up`/`down`/
-  `status` will dispatch through a `Backend` trait. The existing Kubernetes flow
-  becomes one implementation; a `DockerBackend` becomes another whose `up`
-  clones the gitops repo, drops `reconcile.sh` in place, and calls this
-  directory's `install.sh` to start the per-box loop — then `status` shells out
-  to `docker compose ps` per stack. This directory is deliberately **pure shell +
-  plists + docs** so it carries no Rust and does not touch dabba's Cargo build;
-  the Rust trait wraps it later.
-- **Config selection (later).** A `runtime: docker` selector in `dabba.yaml`
-  (alongside today's `substrate:`) will choose the DockerBackend for an
-  environment. Not wired yet.
+An environment selects it with `substrate: docker-host`. That is a value of the
+existing `substrate` field rather than a separate `runtime:` selector — an
+earlier sketch proposed the latter, and folding it in makes contradictory states
+such as `runtime: docker` with `substrate: eks` unrepresentable.
 
-### Deferred to subsequent increments
+These scripts are also **compiled into the dabba binary** and written into the
+environment's working directory on demand. dabba ships as a single binary from a
+GitHub Release, so an installed dabba has no `backends/docker/` on disk;
+resolving it relative to the working directory only ever worked from a git
+checkout. Set `substrateConfig.backendDir` to a working copy when developing the
+reconciler itself.
 
-- **Secrets / OpenBao** — the compose-host equivalent of External Secrets
-  (today the reconciler only reads a box-local `.env`).
-- **The multitool compose artifact** — dabba's own stack (Postgres / OpenBao /
-  MinIO / server) rendered as a compose bundle this backend can converge.
-- **`dabba.yaml runtime: docker`** config selection and the `Backend` trait
-  itself.
+## Portability: what carries across substrates, and what does not
+
+An application can be written once, portably, and rendered for either substrate:
+
+```bash
+dabba application render app.yaml --substrate docker-host   # a compose file
+dabba application render app.yaml --substrate kind          # Kubernetes objects
+```
+
+The shared schema is the **intersection** of what both runtimes genuinely
+honour, not the union — a field that cannot render meaningfully on both sides is
+not in the schema, and a conformance test fails the build if either renderer
+stops honouring one. `dabba application example` prints a definition exercising
+every portable field.
+
+What is **not** portable, and is reported by name rather than silently dropped:
+
+- `kubernetes:` and `dockerHost:` escape blocks, for genuinely substrate-specific
+  configuration. `dabba application portability <file> --substrate <s>` says
+  which of them the target will ignore.
+- Hand-written compose files. They remain fully supported alongside rendered
+  ones — the reconciler's three input paths (verbatim, base+override, rendered)
+  all converge the same way — but a hand-written stack is by definition
+  compose-only.
+- Everything in `spec.tls`, `spec.gateway`, `spec.observability` and
+  `spec.useCases`. Those drive the Kubernetes reconcile layer and a docker-host
+  environment does not consume them.
+
+## Egress policy
+
+multitool's runner screens resolved addresses before connecting — refusing
+loopback, private, link-local, unique-local and carrier-grade NAT ranges, with
+the screening resolver *being* the HTTP client's resolver so DNS rebinding has
+nowhere to stand. That closed a real credential-theft path through the cloud
+metadata endpoint.
+
+Application-level screening and platform-level egress policy are complementary,
+not alternatives. An application cannot be trusted to police itself once it is
+compromised, and the platform cannot know an application's intent. The original
+five-box design had Envoy with per-app allowlists for the platform half; Envoy on
+a single compose host is a great deal of machinery for the job.
+
+**Decided for this backend:**
+
+1. **A stack that needs no egress gets none.** Declare its network `internal:
+   true` through the `dockerHost:` escape hatch. Docker enforces this at the
+   network layer, it costs nothing, and it is the strongest available control.
+   Prefer it wherever it applies.
+2. **Block the cloud metadata endpoint at the host.** `169.254.169.254` is the
+   single highest-value target reachable from a container on a cloud box: it
+   hands out instance credentials to anything that asks. This is a host-level
+   prerequisite, not something the reconciler can do for you, and it is called
+   out here because the reconciler will happily run stacks on a box where it has
+   not been done.
+3. **Per-app allowlists are deliberately NOT built.** The shape, if this is
+   needed later, is an egress proxy container on the stack's network with the
+   application's environment pointed at it — an approximation of Envoy's
+   allowlists without Envoy's weight. Recorded as an option, not a plan, so its
+   absence reads as a decision.
+
+### Trust boundary
+
+**The gitops repository is a trusted input.** `x-health-cmd` is arbitrary shell
+executed on the box every tick, and a stack's compose file can mount any host
+path. Anyone who can commit to a box's subtree of the gitops repo can run code as
+the reconciling user on that box. That is a deliberate design — it is the same
+trust Flux places in its source repository — but it means the gitops repo needs
+the same branch protection and review that the boxes themselves warrant.
+
+Secrets are the exception that proves it: rendered compose files carry secret
+*references*, never values, precisely so the repository can be trusted with the
+former and never holds the latter.
+
+## Testing on this host
+
+| Script | Needs Docker | What it proves |
+| --- | --- | --- |
+| `test/run-test.sh` | yes | deploy, clean no-op, redeploy on change |
+| `test/run-convergence-test.sh` | partly | base+override rendering, health re-checking, fetch failure handling, render diagnostics, a non-default apps dir |
+| `test/run-cron-macos-test.sh` | macOS | per-app scheduled-job agents sync and unsync |
+| `test/run-end-to-end-test.sh` | yes | the whole arc: up, OpenBao initialised and unsealed, a secret resolved into a running application, down leaving stacks up |
+
+The first two run in CI on every pull request. Each one removes every container,
+scheduler unit and directory it creates, and then verifies the removal rather
+than assuming it.
+
+`run-end-to-end-test.sh` is deliberately NOT a CI gate. It installs a real
+scheduler unit, which needs a live user session — a launchd GUI domain on macOS,
+or systemd `--user` with lingering enabled on Linux. Hosted runners generally
+have neither, so running it there would test the runner rather than the
+backend. Run it locally before merging anything that touches `up`, `down`, the
+reconciler, or the secrets path.

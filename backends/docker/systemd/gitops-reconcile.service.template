@@ -19,6 +19,8 @@ Environment=BOX_NAME=__BOX_NAME__
 Environment=GITOPS_APPS_DIR=__GITOPS_APPS_DIR__
 Environment=GITOPS_BRANCH=__GITOPS_BRANCH__
 Environment=DABBA_ENVIRONMENT=__DABBA_ENVIRONMENT__
+Environment=OPENBAO_PROJECT=__OPENBAO_PROJECT__
+Environment=OPENBAO_TOKEN_FILE=__OPENBAO_TOKEN_FILE__
 ExecStart=/bin/bash __RECONCILE_SH__
 # Optional secrets (e.g. SLACK_WEBHOOK_URL) — the leading '-' makes it optional.
 EnvironmentFile=-%h/.dabba-reconcile.env

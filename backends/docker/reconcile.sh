@@ -445,10 +445,32 @@ health_command() {
     sed -n 's/^x-health-cmd: //p' "$1" | head -1
 }
 
+# A YAML block scalar (`x-health-cmd: >-`) puts the command on the FOLLOWING
+# lines, so the extraction above returns the indicator itself. `bash -c '>-'` is
+# a redirect into a file named '-', which succeeds — turning the health gate into
+# something that passes unconditionally while looking like it ran. A
+# crash-looping container was reported "converged and healthy" this way.
+#
+# Rather than teach the extractor to fold block scalars, refuse them: the gate
+# must never be able to pass without having actually run a command.
+health_command_is_usable() {
+    case "$1" in
+        ''|'>'|'>-'|'>+'|'|'|'|-'|'|+')
+            return 1 ;;
+    esac
+    return 0
+}
+
 run_health_gate() {
     local applied="$1" attempts="$2" health i
     health="$(health_command "$applied")"
     [ -n "$health" ] || return 0
+    if ! health_command_is_usable "$health"; then
+        echo "ERROR: x-health-cmd must be a single-line command; got ${health}" >&2
+        echo "       (a YAML block scalar such as '>-' puts the command on the next" >&2
+        echo "        line, where this cannot read it — write it on one line)" >&2
+        return 1
+    fi
     for i in $(seq 1 "$attempts"); do
         if bash -c "$health" > /dev/null 2>&1; then
             return 0

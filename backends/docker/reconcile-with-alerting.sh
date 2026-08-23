@@ -35,7 +35,8 @@ if [ "$rc" -ne 0 ]; then
     # The alert script takes a unit name for its journal lookup; on macOS there is
     # no journal, so pass the launchd label — it is what identifies this job in
     # `launchctl print` and in the log file.
-    "$BACKEND_DIR/reconcile-alert.sh" "io.spicelabs.dabba.reconcile" || true
+    "$BACKEND_DIR/reconcile-alert.sh" \
+        "io.spicelabs.dabba.reconcile.${DABBA_ENVIRONMENT:-default}" || true
 fi
 
 exit "$rc"

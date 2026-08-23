@@ -39,6 +39,10 @@
         <string>__GITOPS_BRANCH__</string>
         <key>DABBA_ENVIRONMENT</key>
         <string>__DABBA_ENVIRONMENT__</string>
+        <key>OPENBAO_PROJECT</key>
+        <string>__OPENBAO_PROJECT__</string>
+        <key>OPENBAO_TOKEN_FILE</key>
+        <string>__OPENBAO_TOKEN_FILE__</string>
         <key>PATH</key>
         <string>__PATH__</string>
     </dict>

@@ -112,6 +112,16 @@ pub fn capture(bin: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run and return stdout regardless of exit status (None only if it cannot spawn).
+///
+/// Some tools use the exit code to report state rather than failure: `bao status`
+/// exits 2 when the vault is sealed, which is information we need, not an error.
+/// [`capture`] would discard the output in exactly that case.
+pub fn capture_including_failures(bin: &str, args: &[&str]) -> Option<String> {
+    let out = Command::new(bin).args(args).output().ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Spawn a detached background process (e.g. a port-forward).
 pub fn spawn(bin: &str, args: &[&str]) -> Result<Child> {
     Command::new(bin)

@@ -48,6 +48,23 @@ pub fn env_secret(workdir: &Path, name: &str, complex: bool) -> Result<String> {
     Ok(val)
 }
 
+/// Write a per-env secret into the workdir at 0600.
+///
+/// For values dabba is GIVEN rather than generates — OpenBao's root token and
+/// unseal key come back from `bao operator init` and have to be kept, since they
+/// cannot be recovered afterwards and cannot live inside the vault they open.
+pub fn write_stash(workdir: &Path, name: &str, value: &str) -> Result<()> {
+    let path = workdir.join(name);
+    std::fs::write(&path, value).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting permissions on {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// Read a stashed per-env secret (empty string if absent) — for `down`, which must
 /// not generate.
 pub fn read_stash(workdir: &Path, name: &str) -> String {
