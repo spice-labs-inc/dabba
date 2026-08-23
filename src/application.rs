@@ -46,10 +46,16 @@
 //! * `dependsOn` — compose has `depends_on`; Kubernetes has no ordering primitive,
 //!   and faking one with init containers would mean the same field meant two
 //!   materially different things.
+//! * `restartPolicy` — this one was in the schema until the Kubernetes renderer was
+//!   written, which is the intersection rule doing its job. A Deployment's pod
+//!   template accepts only `Always`; `OnFailure` and `Never` are valid solely for
+//!   Jobs and bare Pods. Keeping the field would have meant compose honouring three
+//!   values and Kubernetes silently honouring one. Both runtimes restart a
+//!   long-running service by default, so nothing is lost by its absence.
 //!
-//! Anything genuinely substrate-specific belongs in the [`Escapes`] blocks, which
-//! are explicitly non-portable and are reported by name when an application moves
-//! between substrates.
+//! Anything genuinely substrate-specific belongs in the `kubernetes:` and
+//! `dockerHost:` blocks, which are explicitly non-portable and are reported by name
+//! when an application moves between substrates.
 
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
@@ -108,13 +114,20 @@ pub struct ApplicationSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<Resources>,
 
-    /// What to do when the container exits.
+    /// Substrate-specific configuration, merged into the rendered Kubernetes
+    /// objects and ignored on a compose host. Explicitly NOT portable.
+    ///
+    /// These are plain fields rather than a `#[serde(flatten)]` sub-struct because
+    /// serde's `deny_unknown_fields` and `flatten` do not compose: with both, the
+    /// flattened keys were accepted and then silently discarded, so an escape block
+    /// parsed fine and reached neither renderer. Losing `deny_unknown_fields` was
+    /// not an option — it is what makes out-of-scope fields rejected rather than
+    /// ignored, which is the whole point of the schema.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restart_policy: Option<RestartPolicy>,
-
-    /// Substrate-specific configuration. Explicitly NOT portable — see [`Escapes`].
-    #[serde(default, skip_serializing_if = "Escapes::is_empty", flatten)]
-    pub escapes: Escapes,
+    pub kubernetes: Option<serde_yaml::Value>,
+    /// Merged into the rendered compose service; ignored on Kubernetes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_host: Option<serde_yaml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -192,38 +205,6 @@ pub struct Resources {
     /// Kubernetes quantity form ("256Mi", "1Gi"). Converted to compose's `memory`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum RestartPolicy {
-    Always,
-    OnFailure,
-    Never,
-}
-
-/// Substrate-specific configuration, deliberately quarantined.
-///
-/// These blocks are free-form and merged into the rendered output by their own
-/// renderer only. They exist so that needing one non-portable thing does not push
-/// an application out of the shared schema entirely — but they are the boundary of
-/// the portability promise, so [`Application::non_portable_fields`] reports them by
-/// name when an application is moved to a substrate that will ignore them.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct Escapes {
-    /// Merged into the rendered Kubernetes objects. Ignored on a compose host.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kubernetes: Option<serde_yaml::Value>,
-    /// Merged into the rendered compose service. Ignored on Kubernetes.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub docker_host: Option<serde_yaml::Value>,
-}
-
-impl Escapes {
-    pub fn is_empty(&self) -> bool {
-        self.kubernetes.is_none() && self.docker_host.is_none()
-    }
 }
 
 fn default_initial_delay() -> u32 {
@@ -323,10 +304,10 @@ impl Application {
     pub fn non_portable_fields(&self, target_is_kubernetes: bool) -> Vec<&'static str> {
         let mut ignored = Vec::new();
         if target_is_kubernetes {
-            if self.spec.escapes.docker_host.is_some() {
+            if self.spec.docker_host.is_some() {
                 ignored.push("dockerHost");
             }
-        } else if self.spec.escapes.kubernetes.is_some() {
+        } else if self.spec.kubernetes.is_some() {
             ignored.push("kubernetes");
         }
         ignored
@@ -377,7 +358,6 @@ spec:
   resources:
     cpu: "500m"
     memory: 256Mi
-  restartPolicy: on-failure
 "#;
 
 #[cfg(test)]
@@ -413,7 +393,8 @@ mod tests {
         // Fields are skipped on serialise when empty/None, so the key set of the
         // serialised fixture IS the set of fields it exercises. Compare against the
         // full field list obtained by serialising a spec with nothing skipped.
-        let every_field = [
+        // Portable fields must ALL be exercised: they are what conformance covers.
+        let portable_fields = [
             "image",
             "tag",
             "ports",
@@ -421,9 +402,11 @@ mod tests {
             "volumes",
             "healthCheck",
             "resources",
-            "restartPolicy",
         ];
-        for field in every_field {
+        // Escape hatches are the boundary of portability rather than part of it, so
+        // they are permitted in a definition but deliberately absent here.
+        let escape_fields = ["kubernetes", "dockerHost"];
+        for field in portable_fields {
             assert!(
                 mapping.contains_key(serde_yaml::Value::String(field.to_string())),
                 "EXHAUSTIVE_EXAMPLE does not exercise spec.{field}; conformance would \
@@ -436,9 +419,9 @@ mod tests {
         for key in mapping.keys() {
             let key = key.as_str().unwrap_or_default();
             assert!(
-                every_field.contains(&key),
-                "spec.{key} is new; add it to `every_field` and to EXHAUSTIVE_EXAMPLE, \
-                 and make sure BOTH renderers honour it"
+                portable_fields.contains(&key) || escape_fields.contains(&key),
+                "spec.{key} is new; add it to `portable_fields` and to \
+                 EXHAUSTIVE_EXAMPLE, and make sure BOTH renderers honour it"
             );
         }
     }

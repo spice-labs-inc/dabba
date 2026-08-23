@@ -13,6 +13,7 @@ mod application;
 mod backend;
 mod config;
 mod edit;
+mod render;
 mod run;
 
 use anyhow::{Context, Result};
@@ -152,6 +153,14 @@ enum ApplicationAction {
     },
     /// Print a starter definition exercising every portable field
     Example,
+    /// Render a definition for a substrate (compose file, or Kubernetes objects)
+    Render {
+        /// Path to the Application YAML
+        file: PathBuf,
+        /// Substrate to render for (any Kubernetes substrate, or docker-host)
+        #[arg(long, default_value = "docker-host")]
+        substrate: String,
+    },
     /// Report which parts of a definition a given substrate will NOT honour
     Portability {
         /// Path to the Application YAML
@@ -212,6 +221,18 @@ fn main() -> Result<()> {
                 // backends. Printing that exact value means the example users
                 // start from cannot drift from the one that is proven to work.
                 println!("{}", application::EXHAUSTIVE_EXAMPLE.trim_start());
+                Ok(())
+            }
+            ApplicationAction::Render { file, substrate } => {
+                let text = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let app = application::Application::parse(&text)?;
+                let rendered = if substrate == "docker-host" {
+                    render::compose::render(&app)?
+                } else {
+                    render::kubernetes::render(&app)?
+                };
+                print!("{rendered}");
                 Ok(())
             }
             ApplicationAction::Portability { file, substrate } => {
