@@ -120,12 +120,20 @@ pub fn render(app: &Application) -> Result<String> {
     // anything else, so making it a knob would mean it worked on one side only.
     service.insert(string("restart"), string("unless-stopped"));
 
-    // The dockerHost escape hatch is merged last so it can override anything above.
-    if let Some(Value::Mapping(escape)) = &app.spec.docker_host {
-        for (key, value) in escape {
-            service.insert(key.clone(), value.clone());
+    // The dockerHost escape hatch is merged last so it can override anything
+    // above, deeply, for the same reason the Kubernetes side does.
+    let service = match &app.spec.docker_host {
+        Some(escape) => crate::render::deep_merge(Value::Mapping(service), escape.clone()),
+        None => Value::Mapping(service),
+    };
+    let service = match service {
+        Value::Mapping(m) => m,
+        other => {
+            // A non-mapping escape would mean the whole service was replaced by a
+            // scalar; that is a malformed definition rather than an override.
+            anyhow::bail!("dockerHost must be a mapping, got {other:?}")
         }
-    }
+    };
 
     let mut services = Mapping::new();
     services.insert(string(name.clone()), Value::Mapping(service));

@@ -69,21 +69,32 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: render the exhaustive example for both substrates
+      # The exhaustive fixture AND every shipped example. The fixture exercises
+      # every field; real examples combine them in ways it does not, which is how
+      # the escape-hatch merge bug was found.
+      - name: render everything for both substrates
         run: |
-          ./target/release/dabba application example > /tmp/application.yaml
-          ./target/release/dabba application render /tmp/application.yaml \
-            --substrate kind > /tmp/rendered-kubernetes.yaml
-          ./target/release/dabba application render /tmp/application.yaml \
-            --substrate docker-host > /tmp/rendered-compose.yml
-      - name: the Kubernetes output validates against real schemas
+          mkdir -p /tmp/render /tmp/stack
+          ./target/release/dabba application example > /tmp/exhaustive.yaml
+          for f in /tmp/exhaustive.yaml examples/applications/*.yaml; do
+            name="$(basename "$f" .yaml)"
+            ./target/release/dabba application validate "$f"
+            ./target/release/dabba application render "$f" \
+              --substrate kind > "/tmp/render/$name-kubernetes.yaml"
+            ./target/release/dabba application render "$f" \
+              --substrate docker-host > "/tmp/stack/$name-compose.yml"
+          done
+      - name: every Kubernetes rendering validates against real schemas
         run: |
-          docker run --rm -v /tmp:/work ghcr.io/yannh/kubeconform:latest \
-            -strict -summary -kubernetes-version 1.31.0 /work/rendered-kubernetes.yaml
-      - name: the compose output is something docker compose accepts
+          docker run --rm -v /tmp/render:/work ghcr.io/yannh/kubeconform:latest \
+            -strict -summary -kubernetes-version 1.31.0 /work
+      - name: every compose rendering is something docker compose accepts
         run: |
-          mkdir -p /tmp/stack && mv /tmp/rendered-compose.yml /tmp/stack/docker-compose.yml
-          cd /tmp/stack && docker compose config > /dev/null
+          for f in /tmp/stack/*-compose.yml; do
+            dir="$(mktemp -d)"; cp "$f" "$dir/docker-compose.yml"
+            ( cd "$dir" && docker compose config > /dev/null ) \
+              || { echo "::error::$f is not a valid compose file"; exit 1; }
+          done
 
   # Dependency advisories, license policy, banned/duplicate crates, source allow-list.
   cargo-deny:

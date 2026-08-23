@@ -167,12 +167,14 @@ fn deployment(app: &Application) -> Result<Value> {
     deployment.insert(string("spec"), Value::Mapping(spec));
 
     // The kubernetes escape hatch merges last so it can override anything above.
-    if let Some(Value::Mapping(escape)) = &app.spec.kubernetes {
-        for (key, value) in escape {
-            deployment.insert(key.clone(), value.clone());
-        }
-    }
-    Ok(Value::Mapping(deployment))
+    // DEEP merge: a shallow insert let an overlay setting `spec.template` replace
+    // the whole `spec`, selector and all, producing a Deployment the API server
+    // rejects. See `crate::render::deep_merge`.
+    let rendered = Value::Mapping(deployment);
+    Ok(match &app.spec.kubernetes {
+        Some(escape) => crate::render::deep_merge(rendered, escape.clone()),
+        None => rendered,
+    })
 }
 
 fn environment_variable(application: &str, variable: &EnvironmentVariable) -> Value {
@@ -368,6 +370,57 @@ mod tests {
         let app = Application::parse(&source).unwrap();
         let text = render(&app).unwrap();
         assert!(text.contains("marker: applied"));
+    }
+
+    /// The realistic escape-hatch use, and the one that was broken: patching
+    /// something NESTED must not take out its siblings.
+    ///
+    /// The test above passed for as long as the feature was broken, because a
+    /// fresh top-level key looks identical under a shallow insert and a deep
+    /// merge. Only a nested patch tells them apart — the shallow version replaced
+    /// `spec` wholesale, producing a Deployment with no selector. Schema
+    /// validation of a real example is what surfaced it.
+    #[test]
+    fn a_nested_escape_hatch_patch_keeps_the_generated_spec() {
+        const NESTED_PATCH: &str = r#"  kubernetes:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: conformance
+              args:
+                - serve
+"#;
+        let source = format!("{EXHAUSTIVE_EXAMPLE}{NESTED_PATCH}");
+        let app = Application::parse(&source).unwrap();
+        let text = render(&app).unwrap();
+        let documents: Vec<Value> = serde_yaml::Deserializer::from_str(&text)
+            .map(|d| Value::deserialize(d).unwrap())
+            .filter(|v| !v.is_null())
+            .collect();
+        let deployment = kind(&documents, "Deployment");
+
+        assert!(
+            deployment["spec"].get("selector").is_some(),
+            "the generated selector was replaced by the escape hatch:\n{text}"
+        );
+        let containers = deployment["spec"]["template"]["spec"]["containers"]
+            .as_sequence()
+            .expect("containers survived");
+        assert_eq!(
+            containers.len(),
+            1,
+            "the container was appended, not merged"
+        );
+        assert_eq!(containers[0]["args"][0], Value::String("serve".into()));
+        // Everything the renderer produced for that container is still there.
+        assert!(containers[0]["image"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("conformance"));
+        assert!(containers[0].get("readinessProbe").is_some());
+        assert!(containers[0].get("env").is_some());
+        assert!(containers[0].get("volumeMounts").is_some());
     }
 
     #[test]

@@ -249,6 +249,70 @@ mod tests {
         }
     }
 
+    /// Every shipped example must parse and render for BOTH substrates.
+    ///
+    /// The exhaustive fixture exercises every field, but it is written to be
+    /// convenient. Real examples combine features in ways a fixture does not — the
+    /// escape-hatch deep-merge bug was found by schema-validating the MinIO
+    /// example, not by the fixture, because only a real definition patched
+    /// something nested.
+    #[test]
+    fn every_shipped_example_renders_for_both_substrates() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/applications");
+        let entries = std::fs::read_dir(directory).expect("examples/applications exists");
+        let mut checked = 0;
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("yaml") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).unwrap();
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+
+            let app = Application::parse(&text)
+                .unwrap_or_else(|e| panic!("{name} is not a valid definition: {e}"));
+            let compose_output = compose::render(&app)
+                .unwrap_or_else(|e| panic!("{name} does not render for docker-host: {e}"));
+            let kubernetes_output = kubernetes::render(&app)
+                .unwrap_or_else(|e| panic!("{name} does not render for Kubernetes: {e}"));
+
+            // Both outputs must be parseable, not merely produced.
+            serde_yaml::from_str::<serde_yaml::Value>(&compose_output)
+                .unwrap_or_else(|e| panic!("{name} compose output is not valid YAML: {e}"));
+            let documents: Vec<serde_yaml::Value> =
+                serde_yaml::Deserializer::from_str(&kubernetes_output)
+                    .map(|d| serde::Deserialize::deserialize(d).unwrap())
+                    .filter(|v: &serde_yaml::Value| !v.is_null())
+                    .collect();
+
+            // A Deployment without a selector is rejected by the API server. This
+            // is the exact shape the shallow escape-hatch merge produced.
+            for document in &documents {
+                if document.get("kind").and_then(|k| k.as_str()) == Some("Deployment") {
+                    assert!(
+                        document["spec"].get("selector").is_some(),
+                        "{name} renders a Deployment with no selector"
+                    );
+                    assert!(
+                        document["spec"]["template"]["spec"]
+                            .get("containers")
+                            .and_then(|c| c.as_sequence())
+                            .is_some_and(|c| !c.is_empty()),
+                        "{name} renders a Deployment with no containers"
+                    );
+                }
+            }
+            checked += 1;
+        }
+
+        assert!(
+            checked > 0,
+            "no example applications were checked — the directory moved or emptied, \
+             and this test would pass vacuously forever"
+        );
+    }
+
     /// Escape hatches are the boundary of the promise, so each must reach exactly
     /// one renderer. A leak in either direction would mean substrate-specific
     /// configuration silently applying where it was never meant to.
