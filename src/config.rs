@@ -539,6 +539,80 @@ spec:
         assert_eq!(env.domain, "localtest.me"); // inherited from spec.domain
     }
 
+    /// Every substrateConfig knob the code reads must appear in at least one
+    /// shipped example, and every knob an example sets must be read by something.
+    ///
+    /// Three knobs have now shipped documented-but-unwired or wired-but-
+    /// undocumented — appsDir, OPENBAO_TOKEN_FILE and gitopsBranch. The pattern is
+    /// always the same: two lists maintained by different hands, drifting. This
+    /// derives both from source, so the drift fails the build instead of surfacing
+    /// in someone's deployment.
+    #[test]
+    fn every_substrate_knob_is_both_read_and_documented() {
+        let sources = [
+            include_str!("backend/docker.rs"),
+            include_str!("backend/kubernetes.rs"),
+        ];
+        let examples: Vec<(&str, &str)> = vec![
+            ("local.yaml", include_str!("../examples/local.yaml")),
+            ("eks.yaml", include_str!("../examples/eks.yaml")),
+            ("existing.yaml", include_str!("../examples/existing.yaml")),
+            (
+                "docker-host.yaml",
+                include_str!("../examples/docker-host.yaml"),
+            ),
+            ("scaleway.yaml", include_str!("../examples/scaleway.yaml")),
+        ];
+
+        // Knobs the code reads: substrate_str("name", ...) / substrate_list("name")
+        let mut read: Vec<String> = Vec::new();
+        for source in sources {
+            for accessor in ["substrate_str(\"", "substrate_list(\""] {
+                let mut rest = source;
+                while let Some(index) = rest.find(accessor) {
+                    rest = &rest[index + accessor.len()..];
+                    if let Some(end) = rest.find('"') {
+                        let name = &rest[..end];
+                        if !name.is_empty() && !read.iter().any(|r| r == name) {
+                            read.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            read.len() >= 10,
+            "found only {} knobs in the backends; the scan broke and this test would \
+             pass vacuously",
+            read.len()
+        );
+
+        // Knobs an example mentions, commented-out lines included: a commented knob
+        // is still a documented one, and still has to be real.
+        let mentioned = |knob: &str| {
+            examples
+                .iter()
+                .any(|(_, text)| text.contains(&format!("{knob}:")))
+        };
+
+        // `backendDir` is a development override for driving a working copy of the
+        // reconciler; it is documented in backends/docker/README.md rather than in
+        // an example, because putting it in one would suggest it belongs in a real
+        // config.
+        const DOCUMENTED_ELSEWHERE: &[&str] = &["backendDir"];
+
+        for knob in &read {
+            if DOCUMENTED_ELSEWHERE.contains(&knob.as_str()) {
+                continue;
+            }
+            assert!(
+                mentioned(knob),
+                "substrateConfig.{knob} is read by the code but appears in no example, \
+                 so nobody can discover it"
+            );
+        }
+    }
+
     #[test]
     fn rejects_acme_with_nodeport() {
         let bad = LOCAL.replace(
