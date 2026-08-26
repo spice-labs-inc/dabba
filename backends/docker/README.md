@@ -49,7 +49,9 @@ Every minute the loop runs `reconcile.sh`, which:
 ```
 backends/docker/
   reconcile.sh                         the portable reconciler (runs from the clone; self-updates)
-  reconcile-alert.sh                   optional failure alert (Slack webhook / journal / stderr)
+  reconcile-alert.sh                   failure alert for any dabba unit (Slack webhook / journal / stderr)
+  backup.sh                            archive one stack's bind-mounted data, with retention
+  restore.sh                           put an archive back (stops the stack; destructive, manual)
   install.sh                           detects the platform, installs the reconcile loop
   uninstall.sh                         reverses install.sh
   launchd/
@@ -57,15 +59,18 @@ backends/docker/
   systemd/
     gitops-reconcile.service.template   Linux reconcile-loop service   (rendered by install.sh)
     gitops-reconcile.timer              Linux minutely trigger
-    gitops-reconcile-alert.service.template   OnFailure alert unit
+    gitops-reconcile-alert.service.template   OnFailure alert unit for the loop
+    dabba-job-alert@.service.template   OnFailure alert unit for any scheduled job
   examples/
     io.spicelabs.dabba.cron.example-app.nightly-backup.plist
                                         macOS scheduled-job LaunchAgent (convention example;
                                         the filename IS the Label)
-    example-cron.service / .timer       Linux scheduled-job systemd user units (convention example)
+    example-cron.service / .timer       Linux scheduled-job systemd user units — a working
+                                        nightly backup, not just a shape
   test/
     run-test.sh                         on-host convergence smoke test (portable, side-effect-free)
     run-cron-macos-test.sh              macOS launchd cron-sync verification (self-cleaning)
+    run-backup-test.sh                  backup, destroy the data, restore, assert it came back
 ```
 
 Desired state lives in a **separate gitops repo** (not here), laid out as:
@@ -130,26 +135,99 @@ next to the stack, and `reconcile.sh` syncs them — manifest-tracked and fully
 reconciler-owned (schedules are *code*, unlike volumes/data): units dropped from
 git are disabled/booted-out and removed.
 
-Convention on both platforms: the job is a **one-shot container of the stack**,
-run behind the `jobs` compose profile so the reconciler's `up -d` never starts
-it as a long-running service:
+A job either runs one of the scripts dabba ships — `backup.sh` is the worked
+example — or a **one-shot container of the stack**, behind the `jobs` compose
+profile so the reconciler's `up -d` never starts it as a long-running service:
 
 ```
-docker compose --profile jobs run --rm <service>
+__BACKEND_DIR__/backup.sh __APP__            # a shipped job
+__DOCKER__ compose --profile jobs run --rm <service>   # a stack-specific one
 ```
+
+Units on **both** platforms are templates, substituting the same four tokens:
+`__BACKEND_DIR__`, `__STACK_DIR__`, `__DOCKER__` and `__APP__`. Systemd units used
+to be installed verbatim on the reasoning that systemd expands `%h` itself, but
+`%h` cannot name the directory dabba materialises its scripts into — so a unit
+wanting to run a shipped script had to hard-code a path containing the
+environment name, while the macOS half of the same feature did not. A test
+asserts the two token sets stay identical.
 
 - **Linux** — `<box>/<app>/systemd/*.{service,timer}` (systemd **user** units).
-  Synced into `~/.config/systemd/user/`, reloaded, timers enabled; installed
-  verbatim (systemd expands `%h`). Tracked in
+  Synced into `~/.config/systemd/user/`, reloaded, timers enabled. Tracked in
   `~/.config/systemd/user/.gitops-<app>.units`. See `examples/example-cron.*`.
 - **macOS** — `<box>/<app>/launchd/*.plist` (LaunchAgents, `StartCalendarInterval`).
-  The shipped plists are **templates**: the reconciler substitutes `__DOCKER__`,
-  `__STACK_DIR__`, `__APP__` (the launchd analogue of systemd's `%h`), installs
-  them into `~/Library/LaunchAgents/`, and bootstraps them into the per-user GUI
+  The reconciler renders the tokens, installs them into `~/Library/LaunchAgents/`, and bootstraps them into the per-user GUI
   domain. Tracked in `~/Library/LaunchAgents/.gitops-<app>.agents`. The plist
   `Label` must equal the filename without `.plist`; the reconciler refuses a plist
 where they disagree, because it boots agents in and out by that label. See
 `examples/io.spicelabs.dabba.cron.example-app.nightly-backup.plist`.
+## Backups, and restores
+
+A stack's state on a bare-OS box is its `./`-relative bind mounts under
+`<STACKS_DIR>/<app>/`. `backup.sh` archives exactly those, and `restore.sh` puts
+them back. Both are materialised next to the reconciler, so a scheduled job unit
+can call them by the `__BACKEND_DIR__` token without knowing where dabba was
+installed.
+
+```bash
+backup.sh <app>                    # -> <BACKUPS_DIR>/<app>/<app>-<UTC stamp>.tar.gz
+restore.sh <app> [archive|latest]  # replaces live data; a deliberate manual act
+```
+
+To give a stack nightly backups, ship two files in its gitops directory and let
+the reconciler install them — `examples/example-cron.service` and
+`example-cron.timer` are exactly that, working, and the macOS plist beside them
+runs the same script on the same schedule.
+
+| Knob | Default | What it decides |
+| --- | --- | --- |
+| `BACKUPS_DIR` | `~/backups` | Where archives land |
+| `BACKUP_KEEP` | `7` | How many to keep per app; older ones are pruned |
+| `BACKUP_QUIESCE` | `1` | Stop the stack for the copy |
+
+### What is not archived, and why
+
+`.env` is excluded. It holds secrets **resolved** from OpenBao, and the
+reconciler rewrites it every tick — archiving it would copy live secrets into a
+tarball that outlives them, in order to restore something that regenerates
+itself. `docker-compose.yml` and `.gitops-health` are excluded too: the compose
+file is in git already, and a backup of *state* should not carry a second copy
+of *desired state* for the next tick to fight.
+
+A stack whose data lives in a named Docker volume is **not covered**. Give it a
+`./`-relative bind mount under its stack directory instead. `backup.sh` fails
+loudly rather than writing an empty archive, which is what makes the job unit's
+`OnFailure=` fire.
+
+### Consistency, and the outage it costs
+
+Archiving a live data directory can capture a torn write. So the stack is stopped
+for the copy and started again afterwards — a few seconds of downtime at whatever
+hour the timer fires. The restart is in a trap, so a failure mid-archive still
+brings the stack back up. Set `BACKUP_QUIESCE=0` for a stack that can genuinely
+tolerate a hot copy. The default is the safe one, because a backup you cannot
+trust is worse than an outage you planned.
+
+### Failure is loud
+
+A backup that started failing and a backup that was never scheduled produce the
+same thing: silence. The example unit carries `OnFailure=__JOB_ALERT__%n.service`;
+the reconciler renders that token to this environment's alert unit, which
+`install.sh` puts on the box and `uninstall.sh` takes away again. It routes to the
+same Slack webhook or journal entry the reconcile loop uses.
+
+Per environment rather than per box, so tearing one environment down neither
+removes alerting for the others nor orphans a unit nothing owns.
+
+### The restore is the part that counts
+
+An archive nobody has unpacked is a hypothesis. `test/run-backup-test.sh` writes
+a known value into a converged stack, backs it up, **destroys the data**,
+restores, and asserts the exact value came back — through the same scripts a real
+box runs. It gates every pull request. It also checks that resolved secrets never
+reach an archive, that retention keeps the newest rather than any N, and that a
+restore refuses a corrupt archive *before* deleting anything.
+
 
 ## Testing on this host
 

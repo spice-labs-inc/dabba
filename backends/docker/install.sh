@@ -46,6 +46,10 @@ PLATFORM="$(uname -s)"
 # uninstall.sh and the Rust status probe cannot drift apart.
 LABEL="io.spicelabs.dabba.reconcile.$DABBA_ENVIRONMENT"
 UNIT_BASE="gitops-reconcile-$DABBA_ENVIRONMENT"
+# The scheduled-job failure alert, also per environment. A single box-wide unit
+# would be simpler, but then tearing down one environment either removes alerting
+# for the others or leaves a unit behind that nothing owns.
+JOB_ALERT="$UNIT_BASE-job-alert@"
 
 chmod +x "$RECONCILE_SH" "$BACKEND_DIR/reconcile-alert.sh" \
          "$BACKEND_DIR/reconcile-with-alerting.sh" 2>/dev/null || true
@@ -72,6 +76,7 @@ render() {
         -e "s|__OPENBAO_TOKEN_FILE__|$OPENBAO_TOKEN_FILE|g" \
         -e "s|__LABEL__|$LABEL|g" \
         -e "s|__UNIT_BASE__|$UNIT_BASE|g" \
+        -e "s|__JOB_ALERT__|$JOB_ALERT|g" \
         -e "s|__PATH__|$PATH|g" \
         -e "s|__LOG__|$LOG|g" \
         "$src" > "$dest"
@@ -117,6 +122,9 @@ else
     render "$BACKEND_DIR/systemd/gitops-reconcile.service.template" "$UNIT_DIR/$UNIT_BASE.service"
     render "$BACKEND_DIR/systemd/gitops-reconcile-alert.service.template" "$UNIT_DIR/$UNIT_BASE-alert.service"
     render "$BACKEND_DIR/systemd/gitops-reconcile.timer.template" "$UNIT_DIR/$UNIT_BASE.timer"
+    # A job unit from gitops content activates this with
+    # OnFailure=__JOB_ALERT__%n.service, which the reconciler renders.
+    render "$BACKEND_DIR/systemd/dabba-job-alert@.service.template" "$UNIT_DIR/$JOB_ALERT.service"
 
     systemctl --user daemon-reload
     systemctl --user enable --now "$UNIT_BASE.timer"

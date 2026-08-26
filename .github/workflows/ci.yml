@@ -100,6 +100,11 @@ jobs:
         run: bash backends/docker/test/run-convergence-test.sh
       - name: deploy, no-op, redeploy
         run: bash backends/docker/test/run-test.sh
+      # The restore is the reason this gates every pull request. An archive nobody
+      # unpacks is a hypothesis, and a backup that stopped working looks exactly
+      # like one that is working until the day you need it.
+      - name: backup, destroy, restore
+        run: bash backends/docker/test/run-backup-test.sh
       - name: nothing was left running
         if: always()
         run: |

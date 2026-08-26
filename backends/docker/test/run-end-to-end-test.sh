@@ -52,6 +52,17 @@ pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; fails=$((fails + 1)); }
 step() { echo; echo "=== $* ==="; }
 
+# PORTABILITY: a file mode, GNU first then BSD. `stat -f` on GNU means FILESYSTEM
+# status: it ignores the format, prints filesystem information, and exits 0, so a
+# BSD-first fallback never reaches the GNU form on Linux. Both mode checks below
+# were comparing a multi-line filesystem blob against "600" and reporting a
+# correctly-locked-down file as wrong.
+file_mode() {
+    mode="$(stat -c '%a' "$1" 2>/dev/null)"
+    case "$mode" in ''|*[!0-7]*) mode="$(stat -f '%Lp' "$1" 2>/dev/null)" ;; esac
+    printf '%s' "$mode"
+}
+
 cleanup() {
     step "cleanup"
     if [ -f "$CONFIG" ] && [ -x "$DABBA" ]; then
@@ -76,6 +87,15 @@ cleanup() {
         fi
         docker network rm "${project}_default" > /dev/null 2>&1
     done
+    # Containers write into the stacks as their own uid, so some of what they
+    # leave behind is not deletable by the user who started them — MinIO does
+    # exactly this. Remove those from inside a container first, then take the rest
+    # normally. Without this the test passes and still leaves a directory the
+    # person who ran it cannot delete.
+    if have_docker; then
+        docker run --rm -v "$SCRATCH:/scratch" busybox \
+            sh -c 'rm -rf /scratch/* /scratch/.[!.]* 2>/dev/null' > /dev/null 2>&1
+    fi
     rm -rf "$SCRATCH"
 
     # Prove it, rather than trusting the removals above.
@@ -96,13 +116,21 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Not being able to run is a FAILURE here, not a skip.
+#
+# This is the gate a person runs by hand before merging a change to up, down, the
+# reconciler or secrets — it cannot run in CI, which has no user session. Exiting
+# 0 because the setup was missing meant running it, seeing success, and believing
+# the change had been exercised when nothing had run at all. A gate that passes
+# by not running is worse than no gate.
 if ! docker info > /dev/null 2>&1; then
-    echo "SKIP: needs a running docker daemon"
-    exit 0
+    echo "CANNOT RUN: needs a running docker daemon." >&2
+    exit 1
 fi
 if [ ! -x "$DABBA" ]; then
-    echo "SKIP: no dabba binary at $DABBA (cargo build --release first)"
-    exit 0
+    echo "CANNOT RUN: no dabba binary at $DABBA." >&2
+    echo "            Build it first:  cargo build --release" >&2
+    exit 1
 fi
 
 ###############################################################################
@@ -195,7 +223,7 @@ step "3. OpenBao is initialised and unsealed"
     || fail "no root token stashed"
 [ -s "$WORKDIR/openbao-unseal" ] && pass "an unseal key was stashed" \
     || fail "no unseal key stashed"
-if [ "$(stat -f '%Lp' "$WORKDIR/openbao-root" 2>/dev/null || stat -c '%a' "$WORKDIR/openbao-root" 2>/dev/null)" = "600" ]; then
+if [ "$(file_mode "$WORKDIR/openbao-root")" = "600" ]; then
     pass "the root token is 0600"
 else
     fail "the root token is not 0600"
@@ -229,7 +257,7 @@ if [ -f "$WORKDIR/stacks/$APP/.env" ]; then
     grep -q "ECHO_TEXT=$SECRET_VALUE" "$WORKDIR/stacks/$APP/.env" \
         && pass "the reconciler resolved the reference into the stack's .env" \
         || fail "the .env does not carry the resolved secret"
-    perms="$(stat -f '%Lp' "$WORKDIR/stacks/$APP/.env" 2>/dev/null || stat -c '%a' "$WORKDIR/stacks/$APP/.env" 2>/dev/null)"
+    perms="$(file_mode "$WORKDIR/stacks/$APP/.env")"
     [ "$perms" = "600" ] && pass "the resolved .env is 0600" || fail "the .env is $perms, not 0600"
 else
     fail "no .env was written for $APP"

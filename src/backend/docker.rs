@@ -1168,6 +1168,95 @@ mod tests {
         assert_eq!(branch.1, Some("release".to_string()));
     }
 
+    /// Both schedulers must substitute the SAME tokens.
+    ///
+    /// They did not: launchd plists were rendered and systemd units were copied
+    /// verbatim, on the reasoning that systemd expands `%h` itself. But `%h` cannot
+    /// name the directory dabba materialises its scripts into, so a unit that wanted
+    /// to run the shipped `backup.sh` had to hard-code an absolute path containing
+    /// the environment name — while the macOS half of the same feature did not.
+    /// A capability present on one platform and absent on the other is the shape of
+    /// bug this backend keeps producing, so it is asserted rather than remembered.
+    #[test]
+    fn both_schedulers_substitute_the_same_tokens() {
+        let reconciler = include_str!("../../backends/docker/reconcile.sh");
+
+        /// The `__TOKEN__` names a `sed -e "s|__X__|...|g"` line substitutes, within
+        /// one function of the script.
+        fn tokens_substituted_by(reconciler: &str, function: &str) -> Vec<String> {
+            let body = reconciler
+                .split_once(&format!("{function}() {{"))
+                .unwrap_or_else(|| panic!("{function} is defined in reconcile.sh"))
+                .1
+                .split_once("\n}\n")
+                .expect("the function is closed")
+                .0;
+            let mut tokens: Vec<String> = body
+                .lines()
+                .filter_map(|line| {
+                    let start = line.find("s|__")? + 2;
+                    let rest = &line[start..];
+                    let end = rest.find("__|")? + 2;
+                    Some(rest[..end].to_string())
+                })
+                .collect();
+            tokens.sort();
+            tokens.dedup();
+            tokens
+        }
+
+        let systemd = tokens_substituted_by(reconciler, "sync_systemd_units");
+        let launchd = tokens_substituted_by(reconciler, "sync_launchd_agents");
+
+        assert!(
+            systemd.len() >= 4,
+            "parsed only {systemd:?} out of sync_systemd_units; the parser broke and \
+             this test would pass vacuously"
+        );
+        assert_eq!(
+            systemd, launchd,
+            "the two schedulers substitute different tokens, so a job unit that works \
+             on one host silently does not on the other"
+        );
+
+        // And every token the shipped examples use must be one of them, or the
+        // example installs a unit with a literal __TOKEN__ in its ExecStart.
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/docker/examples");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&directory).expect("the examples directory") {
+            let path = entry.expect("an examples entry").path();
+            if !path.is_file() {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).expect("reading the example");
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            for line in body.lines() {
+                // Skip the prose: the header comments name the tokens to explain them.
+                if line.trim_start().starts_with('#') || line.trim_start().starts_with("<!--") {
+                    continue;
+                }
+                let mut rest = line;
+                while let Some(start) = rest.find("__") {
+                    let after = &rest[start + 2..];
+                    let Some(end) = after.find("__") else { break };
+                    let token = format!("__{}__", &after[..end]);
+                    assert!(
+                        systemd.contains(&token),
+                        "{name} uses {token}, which the reconciler never substitutes — \
+                         it would install a unit with that text left in it"
+                    );
+                    checked += 1;
+                    rest = &after[end + 2..];
+                }
+            }
+        }
+        assert!(
+            checked > 0,
+            "no tokens were found in any shipped example, so this half of the test \
+             would pass vacuously"
+        );
+    }
+
     /// These strings must match backends/docker/install.sh, which derives the same
     /// names independently. A drift here means `status` cannot find a running loop.
     #[test]
@@ -1180,6 +1269,49 @@ mod tests {
         assert!(
             install.contains(r#"UNIT_BASE="gitops-reconcile-$DABBA_ENVIRONMENT""#),
             "install.sh no longer derives the unit name the way systemd_timer does"
+        );
+    }
+
+    /// The unit a job names in `OnFailure=` is rendered by the reconciler; the unit
+    /// that actually exists is rendered by install.sh; and uninstall.sh has to
+    /// remove that same one. Three files deriving one name independently is the
+    /// arrangement that produced every naming bug in this backend so far.
+    #[test]
+    fn the_job_alert_unit_is_named_the_same_way_everywhere() {
+        let reconciler = include_str!("../../backends/docker/reconcile.sh");
+        let install = include_str!("../../backends/docker/install.sh");
+        let uninstall = include_str!("../../backends/docker/uninstall.sh");
+
+        assert!(
+            reconciler.contains(
+                r#"JOB_ALERT_UNIT="gitops-reconcile-${DABBA_ENVIRONMENT:-default}-job-alert@""#
+            ),
+            "reconcile.sh no longer derives the job alert unit the expected way"
+        );
+        assert!(
+            install.contains(r#"JOB_ALERT="$UNIT_BASE-job-alert@""#),
+            "install.sh no longer derives the job alert unit the expected way"
+        );
+        assert!(
+            uninstall.contains(r#"JOB_ALERT="$UNIT_BASE-job-alert@""#),
+            "uninstall.sh no longer derives the job alert unit the expected way"
+        );
+        // UNIT_BASE is gitops-reconcile-$DABBA_ENVIRONMENT in both scripts, so the
+        // two spellings above agree. Assert that rather than assuming it.
+        assert!(
+            install.contains(r#"UNIT_BASE="gitops-reconcile-$DABBA_ENVIRONMENT""#)
+                && uninstall.contains(r#"UNIT_BASE="gitops-reconcile-$DABBA_ENVIRONMENT""#),
+            "UNIT_BASE changed, so the job alert unit names no longer agree"
+        );
+
+        // And it must actually be installed and removed, not merely named.
+        assert!(
+            install.contains(r#"render "$BACKEND_DIR/systemd/dabba-job-alert@.service.template""#),
+            "install.sh no longer installs the job alert unit"
+        );
+        assert!(
+            uninstall.contains(r#""$UNIT_DIR/$JOB_ALERT.service""#),
+            "uninstall.sh no longer removes the job alert unit, so teardown leaves it behind"
         );
     }
 

@@ -23,6 +23,13 @@ services:
     # listener stanza twice and the second bind fails with "address already in
     # use" — a crash loop whose message points nowhere near the cause.
     command: server
+    # The server runs as uid 100, and its data is a bind mount created by the
+    # reconciler as the host user — mode 755 under the common umask, which uid 100
+    # cannot write. So it runs as the host user instead; the reconciler puts
+    # DABBA_UID/DABBA_GID in the stack .env. Without this `bao operator init` fails
+    # with a permission error naming a path inside the container, and every stack
+    # that needs a secret fails behind it.
+    user: "${DABBA_UID:-0}:${DABBA_GID:-0}"
     ports:
       - "127.0.0.1:8220:8200"
     volumes:

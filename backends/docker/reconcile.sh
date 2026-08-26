@@ -46,6 +46,10 @@ GITOPS_BRANCH="${GITOPS_BRANCH:-main}"
 # a stack that needs a secret fails loudly rather than deploying half-configured.
 OPENBAO_PROJECT="${OPENBAO_PROJECT:-gitops-openbao}"
 OPENBAO_TOKEN_FILE="${OPENBAO_TOKEN_FILE:-}"
+# This environment's scheduled-job failure alert unit, as the __JOB_ALERT__ token
+# a job in gitops content writes OnFailure= against. Per environment, so tearing
+# one down neither removes alerting for the others nor orphans a unit.
+JOB_ALERT_UNIT="gitops-reconcile-${DABBA_ENVIRONMENT:-default}-job-alert@"
 BOX_DIR="$GITOPS_DIR/$GITOPS_APPS_DIR/$BOX"
 
 # Consecutive-fetch-failure counter, kept in the reconciler-owned stacks dir.
@@ -56,6 +60,13 @@ FETCH_FAILURE_LIMIT=5
 # PORTABILITY: detect the host so the scheduled-jobs sync (bottom of the file)
 # can pick systemd --user on Linux vs launchd LaunchAgents on macOS.
 PLATFORM="$(uname -s)"   # "Darwin" = macOS, "Linux" = systemd hosts
+
+# This script's own directory — where dabba materialised the reconciler, and so
+# where backup.sh and restore.sh sit. Resolved BEFORE the cd below, because $0 is
+# relative when the scheduler invokes it that way. Scheduled job units get it as
+# the __BACKEND_DIR__ token, which is what lets a unit in git call the shipped
+# backup without hard-coding a path that contains the environment name.
+BACKEND_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 cd "$GITOPS_DIR" 2>/dev/null || true   # cwd-independence: tools below resolve paths absolutely
 
@@ -102,13 +113,19 @@ fi
 
 # ---- scheduled jobs (gitops crons): Linux systemd user units ---------------
 # A stack may ship <app>/systemd/*.{service,timer} — systemd USER units that
-# run its one-shot jobs (convention: `docker compose --profile jobs run --rm
-# <service>`, WorkingDirectory=%h/stacks/<app>). They are synced into
-# ~/.config/systemd/user, timers enabled; units dropped from git are disabled
-# and removed (tracked in a per-app manifest, so units are fully
-# reconciler-owned — schedules are code, unlike volumes/data). Requires
-# `loginctl enable-linger <user>` once per box so user units run without a
-# login session.
+# run its one-shot jobs. They are synced into ~/.config/systemd/user, timers
+# enabled; units dropped from git are disabled and removed (tracked in a per-app
+# manifest, so units are fully reconciler-owned — schedules are code, unlike
+# volumes/data). Requires `loginctl enable-linger <user>` once per box so user
+# units run without a login session.
+#
+# Like the launchd plists, these are TEMPLATES: the same __STACK_DIR__,
+# __DOCKER__, __APP__ and __BACKEND_DIR__ tokens are substituted before install.
+# They used to be copied verbatim, on the reasoning that systemd expands %h
+# itself — but %h cannot name the directory dabba materialises its scripts into,
+# so a unit wanting to run the shipped backup.sh had to hard-code an absolute
+# path containing the environment name. One machine-independent file in git now
+# renders to a concrete unit on any box, exactly as it already did on macOS.
 sync_systemd_units() {
     local app="$1" src="$2"
     local unit_dir="$HOME/.config/systemd/user"
@@ -116,17 +133,29 @@ sync_systemd_units() {
     [ -d "$src" ] || [ -f "$manifest" ] || return 0
     export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
     mkdir -p "$unit_dir"
-    local new="" changed=""
+    local new="" changed="" stack_dir docker_bin
+    stack_dir="$STACKS_DIR/$app"
+    docker_bin="$(command -v docker || echo /usr/bin/docker)"
     if [ -d "$src" ]; then
         for u in "$src"/*.service "$src"/*.timer; do
             [ -f "$u" ] || continue
-            local name
+            local name rendered
             name="$(basename "$u")"
             new="$new$name"$'\n'
-            if ! cmp -s "$u" "$unit_dir/$name"; then
-                cp "$u" "$unit_dir/$name"
+            # Compare the RENDERED unit against the installed one, so a
+            # token-only change (STACKS_DIR moved, dabba reinstalled elsewhere)
+            # is still detected as a change.
+            rendered="$(mktemp "${TMPDIR:-/tmp}/dabba-unit.XXXXXX")"
+            sed -e "s|__STACK_DIR__|$stack_dir|g" \
+                -e "s|__DOCKER__|$docker_bin|g" \
+                -e "s|__BACKEND_DIR__|$BACKEND_DIR|g" \
+                -e "s|__JOB_ALERT__|$JOB_ALERT_UNIT|g" \
+                -e "s|__APP__|$app|g" "$u" > "$rendered"
+            if ! cmp -s "$rendered" "$unit_dir/$name"; then
+                cp "$rendered" "$unit_dir/$name"
                 changed=1
             fi
+            rm -f "$rendered"
         done
     fi
     if [ -f "$manifest" ]; then
@@ -185,6 +214,8 @@ sync_launchd_agents() {
             rendered="$(mktemp "${TMPDIR:-/tmp}/dabba-agent.XXXXXX")"
             sed -e "s|__STACK_DIR__|$stack_dir|g" \
                 -e "s|__DOCKER__|$docker_bin|g" \
+                -e "s|__BACKEND_DIR__|$BACKEND_DIR|g" \
+                -e "s|__JOB_ALERT__|$JOB_ALERT_UNIT|g" \
                 -e "s|__APP__|$app|g" "$p" > "$rendered"
             # The reconciler boots agents in and out by "gui/<uid>/<label>", so a
             # plist whose Label disagrees with its filename installs once and can
@@ -549,9 +580,22 @@ for dir in "$BOX_DIR"/*/; do
     # containers/volumes/networks can never collide with (or adopt) anything
     # that predates this process on the box. Written to .env so manual
     # docker compose runs in the stack dir land in the same project.
-    if ! grep -qs '^COMPOSE_PROJECT_NAME=' "$applied_dir/.env"; then
-        echo "COMPOSE_PROJECT_NAME=gitops-$app" >> "$applied_dir/.env"
-    fi
+    #
+    # DABBA_UID/DABBA_GID exist because pre-creating the bind sources above is only
+    # half of the ownership problem. The directories are made with this user and
+    # this umask, so on a host with the common umask 022 they are mode 755 owned by
+    # the host user — and an image whose server runs as a different uid cannot write
+    # them. OpenBao runs its server as uid 100: `bao operator init` fails with a
+    # permission error naming a path inside the container, and the whole secrets arc
+    # fails with it. It survives only where the umask happens to be 002 and the
+    # container shares the group. A stack in that position declares
+    # `user: "${DABBA_UID}:${DABBA_GID}"` and writes as the uid that owns its data.
+    ensure_env() {
+        grep -qs "^$1=" "$applied_dir/.env" || echo "$1=$2" >> "$applied_dir/.env"
+    }
+    ensure_env COMPOSE_PROJECT_NAME "gitops-$app"
+    ensure_env DABBA_UID "$(id -u)"
+    ensure_env DABBA_GID "$(id -g)"
     cp "$desired" "$applied"
     rm -f "$desired"
 

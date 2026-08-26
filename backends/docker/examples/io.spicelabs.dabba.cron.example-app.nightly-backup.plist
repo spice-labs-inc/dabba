@@ -24,15 +24,13 @@
     <key>Label</key>
     <string>io.spicelabs.dabba.cron.example-app.nightly-backup</string>
 
+    <!-- The same shipped backup the systemd example runs, so a stack gets the
+         same behaviour on either host from the same two small files. -->
     <key>ProgramArguments</key>
     <array>
-        <string>__DOCKER__</string>
-        <string>compose</string>
-        <string>--profile</string>
-        <string>jobs</string>
-        <string>run</string>
-        <string>--rm</string>
-        <string>backup</string>
+        <string>/bin/bash</string>
+        <string>__BACKEND_DIR__/backup.sh</string>
+        <string>__APP__</string>
     </array>
 
     <key>WorkingDirectory</key>

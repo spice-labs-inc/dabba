@@ -87,12 +87,36 @@ const ASSETS: &[Asset] = &[
         contents: include_str!("../../backends/docker/systemd/gitops-reconcile.timer.template"),
         executable: false,
     },
+    Asset {
+        relative_path: "systemd/dabba-job-alert@.service.template",
+        contents: include_str!("../../backends/docker/systemd/dabba-job-alert@.service.template"),
+        executable: false,
+    },
+    // The backup pair. Embedded rather than left as examples because a scheduled
+    // job unit points at an absolute path on the box, and an installed dabba has
+    // no checkout to point at.
+    Asset {
+        relative_path: "backup.sh",
+        contents: include_str!("../../backends/docker/backup.sh"),
+        executable: true,
+    },
+    Asset {
+        relative_path: "restore.sh",
+        contents: include_str!("../../backends/docker/restore.sh"),
+        executable: true,
+    },
 ];
 
 /// The scripts that must be present for a directory to be a usable reconciler.
 /// Shared with the `backendDir` override path so a wrong path fails the same way
 /// whether the files were embedded or checked out.
-pub const REQUIRED_SCRIPTS: &[&str] = &["reconcile.sh", "install.sh", "uninstall.sh"];
+pub const REQUIRED_SCRIPTS: &[&str] = &[
+    "reconcile.sh",
+    "install.sh",
+    "uninstall.sh",
+    "backup.sh",
+    "restore.sh",
+];
 
 /// Write the embedded reconciler into `parent/reconciler/`, returning that path.
 ///
