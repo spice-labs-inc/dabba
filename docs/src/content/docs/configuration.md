@@ -59,6 +59,9 @@ cluster it needs to run in.
 What it does **not** share with the Kubernetes substrates is worth knowing
 before choosing it:
 
+- Observability on `docker-host` arrives as an application rather than as a
+  substrate feature — see `examples/applications/observability-openobserve.yaml`,
+  which renders for either substrate from one definition.
 - `spec.tls`, `spec.gateway`, `spec.observability` and `spec.useCases` drive the
   Kubernetes reconcile layer and are not consumed here.
 - Gitops content is a different artifact format entirely: a compose host reads

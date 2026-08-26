@@ -68,6 +68,13 @@ spec:
     # MinIO needs the data directory as an argument; there is no environment
     # variable for it. Exactly what the escape hatch is for.
     command: ["server", "/data"]
+    # Its data is a bind mount the reconciler creates as the host user, mode 755
+    # under the common umask, and this image does not run as that user. Running as
+    # the owning uid is what lets it write at all — and it is also what keeps the
+    # files removable afterwards, rather than leaving a directory behind that the
+    # person who created it cannot delete. Kubernetes needs none of this: the
+    # volume is a claim, and the kubelet handles ownership.
+    user: "${DABBA_UID:-0}:${DABBA_GID:-0}"
 
   kubernetes:
     spec:

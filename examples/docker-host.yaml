@@ -9,7 +9,11 @@
 # What this substrate does NOT share with the Kubernetes ones is worth knowing
 # before you pick it. `spec.tls`, `spec.gateway`, `spec.observability` and
 # `spec.useCases` drive the Kubernetes reconcile layer and are not consumed here,
-# so they are deliberately absent below rather than set and ignored. Gitops
+# so they are deliberately absent below rather than set and ignored.
+#
+# Observability is not lost with them. It arrives as an application rather than as
+# a substrate feature: examples/applications/observability-openobserve.yaml renders
+# for this substrate and for Kubernetes from one definition. Gitops
 # content is not portable either: a compose host consumes
 # `apps/<box>/<app>/docker-compose.yml`, not kustomizations and HelmReleases.
 #
