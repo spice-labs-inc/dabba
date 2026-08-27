@@ -97,8 +97,16 @@ jobs:
           done
       - name: every Kubernetes rendering validates against real schemas
         run: |
+          # ExternalSecret is a CRD, so the built-in schemas do not cover it and
+          # -strict treats that as an error. Point kubeconform at the published
+          # schema for it rather than skipping the kind: the whole value of this
+          # step is that what the renderer emits is something a real API server
+          # would accept, and a skipped kind is one nothing checks.
           docker run --rm -v /tmp/render:/work ghcr.io/yannh/kubeconform:latest \
-            -strict -summary -kubernetes-version 1.31.0 /work
+            -strict -summary -kubernetes-version 1.31.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /work
       - name: every compose rendering is something docker compose accepts
         run: |
           for f in /tmp/stack/*-compose.yml; do
