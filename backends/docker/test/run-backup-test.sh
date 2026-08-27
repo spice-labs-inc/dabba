@@ -39,6 +39,27 @@ pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; fails=$((fails + 1)); }
 have_docker() { docker info > /dev/null 2>&1; }
 
+# Wait for a condition rather than sampling it once.
+#
+# `docker compose start` returns before the daemon lists the container as
+# running, so an assertion taken the instant a script returns can be false while
+# nothing is wrong. On a quiet machine it never fires; under load it does, and a
+# gate that fails at random teaches people to re-run until it passes, which is
+# worse than having no gate.
+wait_for() {
+    attempts="$1"; shift
+    while [ "$attempts" -gt 0 ]; do
+        if "$@"; then return 0; fi
+        attempts=$((attempts - 1))
+        sleep 1
+    done
+    return 1
+}
+
+stack_is_running() {
+    [ -n "$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null)" ]
+}
+
 cleanup() {
     echo
     echo "--- cleanup ---"
@@ -139,8 +160,7 @@ else
 fi
 
 # --- 5. the stack is running again after a restore --------------------------
-running="$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null | wc -l | tr -d ' ')"
-if [ "$running" != "0" ]; then
+if wait_for 30 stack_is_running; then
     pass "the stack is running again after the restore"
 else
     fail "the restore left the stack stopped"
