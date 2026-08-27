@@ -1232,6 +1232,68 @@ mod tests {
         );
     }
 
+    /// The reconciler never destroys data. That is the promise this backend is
+    /// built on — `down` leaves stacks running, removing an app from git stops
+    /// managing it rather than deleting it — and until now it was written in three
+    /// comments and enforced nowhere.
+    ///
+    /// A loop that runs unattended every minute is the worst possible place to
+    /// discover that someone added a teardown to an error path. restore.sh is the
+    /// one script allowed to destroy, deliberately and by hand, so it is not
+    /// covered here.
+    #[test]
+    fn the_reconciler_contains_nothing_that_destroys_data() {
+        let reconciler = include_str!("../../backends/docker/reconcile.sh");
+
+        // Each entry is a command that removes something a person would miss.
+        const DESTRUCTIVE: &[(&str, &str)] = &[
+            (
+                "compose down",
+                "tears a stack down, taking its containers with it",
+            ),
+            ("volume rm", "deletes a named volume and everything in it"),
+            ("volume prune", "deletes every unused volume on the box"),
+            (
+                "system prune",
+                "deletes across the whole daemon, not just this stack",
+            ),
+            ("image prune", "deletes images other projects may be using"),
+            (
+                "rm -rf",
+                "removes a tree, and the trees here hold application data",
+            ),
+            (
+                "docker rm",
+                "removes containers this loop is supposed to converge",
+            ),
+        ];
+
+        for line in reconciler.lines() {
+            let code = line.trim();
+            // Prose explaining what it does NOT do is the whole point of the file.
+            if code.starts_with('#') {
+                continue;
+            }
+            for (command, why) in DESTRUCTIVE {
+                assert!(
+                    !code.contains(command),
+                    "reconcile.sh contains `{command}`, which {why}. The reconciler never \
+                     destroys: removing an app from git stops managing it, and tearing it \
+                     down stays a deliberate act. If this is genuinely needed, it belongs \
+                     in restore.sh or in a person's hands, not in a loop that runs every \
+                     minute unattended.\n  offending line: {code}"
+                );
+            }
+        }
+
+        // The promise is only worth testing if the file is the one we think it is.
+        assert!(
+            reconciler.contains("docker compose pull") && reconciler.contains("up -d"),
+            "reconcile.sh no longer looks like the reconciler; this check is aimed at \
+             the wrong file"
+        );
+    }
+
     /// These strings must match backends/docker/install.sh, which derives the same
     /// names independently. A drift here means `status` cannot find a running loop.
     #[test]

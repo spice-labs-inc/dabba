@@ -50,6 +50,7 @@ Every minute the loop runs `reconcile.sh`, which:
 backends/docker/
   reconcile.sh                         the portable reconciler (runs from the clone; self-updates)
   reconcile-alert.sh                   failure alert for any dabba unit (Slack webhook / journal / stderr)
+  reconcile-with-alerting.sh           macOS wrapper: runs the loop, alerts if it fails
   backup.sh                            archive one stack's bind-mounted data, with retention
   restore.sh                           put an archive back (stops the stack; destructive, manual)
   install.sh                           detects the platform, installs the reconcile loop
@@ -58,7 +59,7 @@ backends/docker/
     io.spicelabs.dabba.reconcile.plist.template   macOS reconcile-loop LaunchAgent (rendered by install.sh)
   systemd/
     gitops-reconcile.service.template   Linux reconcile-loop service   (rendered by install.sh)
-    gitops-reconcile.timer              Linux minutely trigger
+    gitops-reconcile.timer.template     Linux minutely trigger
     gitops-reconcile-alert.service.template   OnFailure alert unit for the loop
     dabba-job-alert@.service.template   OnFailure alert unit for any scheduled job
   examples/
