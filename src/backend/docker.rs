@@ -335,7 +335,7 @@ fn ensure_openbao_ready(env: &ResolvedEnv, workdir: &Path, gitops_dir: &Path) ->
 fn initialize_openbao(env: &ResolvedEnv, workdir: &Path) -> Result<()> {
     log(&format!("[{}] initialising OpenBao (first run)", env.name));
     let container = openbao_container()?;
-    let output = run::capture(
+    let output = run::capture_explaining_failure(
         "docker",
         &[
             "exec",
@@ -346,7 +346,7 @@ fn initialize_openbao(env: &ResolvedEnv, workdir: &Path) -> Result<()> {
              -key-shares=1 -key-threshold=1 -format=json",
         ],
     )
-    .context("running `bao operator init`")?;
+    .context("initialising OpenBao")?;
 
     let value: serde_yaml::Value =
         serde_yaml::from_str(&output).context("parsing `bao operator init` output")?;
@@ -525,6 +525,7 @@ fn status(config: &Path, env_name: Option<&str>) -> Result<()> {
     let env = cfg.resolve(env_name)?;
     let workdir = env_workdir(config, &env.name)?;
     let stacks_dir = workdir.join("stacks");
+    let backups = backups_dir(&workdir);
 
     println!(
         "environment: {}  (substrate: {:?}, domain: {})",
@@ -567,10 +568,64 @@ fn status(config: &Path, env_name: Option<&str>) -> Result<()> {
                 println!("      {line}");
             }
         }
+        match latest_backup(&backups, &app) {
+            Some((archive, kept)) => println!(
+                "      last backup:  {}  ({kept} kept)",
+                backup_stamp(&archive).unwrap_or(archive)
+            ),
+            None => println!("      last backup:  none"),
+        }
     }
     Ok(())
 }
 
+/// Where this environment keeps its archives.
+///
+/// One function, because `status` reads this directory and the reconciler is told
+/// about it through `BACKUPS_DIR` — two places deriving the same path independently
+/// is how the scheduler identity went wrong before it was fixed.
+fn backups_dir(workdir: &Path) -> PathBuf {
+    workdir.join("backups")
+}
+
+/// The newest archive for an application, and how many are kept.
+///
+/// backup.sh names them `<app>-<UTC stamp>.tar.gz` with a sortable stamp, so the
+/// newest is the last by name. Reported because a backup you cannot see the age of
+/// is one you are trusting rather than checking: the alert says when a run FAILED,
+/// and this says whether one ever succeeded.
+fn latest_backup(backups: &Path, app: &str) -> Option<(String, usize)> {
+    let entries = std::fs::read_dir(backups.join(app)).ok()?;
+    let mut archives: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            (name.starts_with(&format!("{app}-")) && name.ends_with(".tar.gz")).then_some(name)
+        })
+        .collect();
+    archives.sort();
+    let newest = archives.last()?.clone();
+    Some((newest, archives.len()))
+}
+
+/// The UTC stamp out of an archive name, as it was written — no timezone guessing,
+/// because this runs on machines in places this code does not know about.
+fn backup_stamp(archive: &str) -> Option<String> {
+    let stamp = archive.strip_suffix(".tar.gz")?.rsplit_once('-')?.1;
+    // YYYYMMDDTHHMMSSZ
+    if stamp.len() != 16 || !stamp.ends_with('Z') || !stamp.contains('T') {
+        return None;
+    }
+    Some(format!(
+        "{}-{}-{} {}:{}:{} UTC",
+        &stamp[0..4],
+        &stamp[4..6],
+        &stamp[6..8],
+        &stamp[9..11],
+        &stamp[11..13],
+        &stamp[13..15]
+    ))
+}
 /// `docker compose -p <project> ps` for a managed project, falling back to a plain
 /// `docker ps` label filter if compose reports nothing (both are honest views of the
 /// project's containers).
@@ -740,6 +795,13 @@ fn reconciler_environment(
             Some(stacks_dir.to_string_lossy().into_owned()),
         ),
         ("GITOPS_APPS_DIR".to_string(), Some(apps_dir(env))),
+        // Beside the stacks, and per environment for the same reason the scheduler
+        // identity is: two environments on one box with an app of the same name
+        // would otherwise write archives over each other.
+        (
+            "BACKUPS_DIR".to_string(),
+            Some(backups_dir(workdir).to_string_lossy().into_owned()),
+        ),
         (
             "GITOPS_BRANCH".to_string(),
             Some(env.substrate_str("gitopsBranch", "main")),
@@ -1126,6 +1188,50 @@ mod tests {
         );
     }
 
+    /// A shipped job unit must pass every location the script it runs needs.
+    ///
+    /// `backup.sh` falls back to `$HOME/stacks` and `$HOME/backups`, which is
+    /// nowhere near where a dabba-managed environment keeps anything — stacks live
+    /// under the per-environment working directory. The shipped units invoked that
+    /// script without setting either, so following the example produced a backup
+    /// job that could never find the stack it was meant to archive. The test suite
+    /// missed it because it calls the script directly with the variables already
+    /// set, which is exactly the shape of a test that cannot see this.
+    #[test]
+    fn a_shipped_job_unit_passes_every_location_its_script_needs() {
+        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("backends/docker/examples");
+        // Variables the script reads to LOCATE things, as opposed to tuning knobs
+        // that have a sensible default (BACKUP_KEEP, BACKUP_QUIESCE).
+        const LOCATIONS: &[&str] = &["STACKS_DIR", "BACKUPS_DIR"];
+
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&directory).expect("the examples directory") {
+            let path = entry.expect("an examples entry").path();
+            if !path.is_file() {
+                continue;
+            }
+            let body = std::fs::read_to_string(&path).expect("reading the example");
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            // Only units that actually invoke one of the shipped scripts.
+            if !body.contains("backup.sh") && !body.contains("restore.sh") {
+                continue;
+            }
+            for variable in LOCATIONS {
+                assert!(
+                    body.contains(variable),
+                    "{name} runs a shipped script but never sets {variable}, so the job \
+                     would look under $HOME instead of this environment"
+                );
+            }
+            checked += 1;
+        }
+        assert!(
+            checked >= 2,
+            "expected a systemd and a launchd example invoking a shipped script, found \
+             {checked} — this test would pass vacuously"
+        );
+    }
+
     /// These strings must match backends/docker/install.sh, which derives the same
     /// names independently. A drift here means `status` cannot find a running loop.
     #[test]
@@ -1249,6 +1355,66 @@ mod tests {
     #[test]
     fn applied_apps_is_empty_when_nothing_has_been_applied() {
         assert!(applied_apps(Path::new("/nonexistent/stacks")).is_empty());
+    }
+
+    /// The alert says when a backup RUN failed. This says whether one ever
+    /// succeeded, which is the question you actually have about a backup.
+    #[test]
+    fn status_reports_the_newest_archive_and_how_many_are_kept() {
+        let guard = ScratchDirectory::new("docker-backup-status");
+        let backups = guard.path().join("app");
+        std::fs::create_dir_all(&backups).unwrap();
+
+        assert_eq!(
+            latest_backup(guard.path(), "app"),
+            None,
+            "an empty directory has no backups"
+        );
+
+        // Deliberately created out of order: the stamp decides which is newest, not
+        // the filesystem.
+        for stamp in ["20260826T033000Z", "20260824T033000Z", "20260825T033000Z"] {
+            std::fs::write(backups.join(format!("app-{stamp}.tar.gz")), "x").unwrap();
+        }
+        // Something that is not an archive must not be counted as one.
+        std::fs::write(backups.join("app-20260826T033000Z.tar.gz.partial"), "x").unwrap();
+        std::fs::write(backups.join("notes.txt"), "x").unwrap();
+
+        let (newest, kept) = latest_backup(guard.path(), "app").expect("archives were found");
+        assert_eq!(newest, "app-20260826T033000Z.tar.gz");
+        assert_eq!(kept, 3, "a partial and a stray file are not backups");
+    }
+
+    /// Rendered as the stamp was written. No timezone is guessed: this runs on
+    /// machines in places this code knows nothing about.
+    #[test]
+    fn a_backup_stamp_renders_as_written() {
+        assert_eq!(
+            backup_stamp("app-20260826T033000Z.tar.gz").as_deref(),
+            Some("2026-08-26 03:30:00 UTC")
+        );
+        assert_eq!(backup_stamp("app-not-a-stamp.tar.gz"), None);
+        assert_eq!(backup_stamp("app-20260826T0330Z.tar.gz"), None);
+    }
+
+    /// `status` reads the archives and the reconciler is told where to write them.
+    /// Two derivations of one path is how the scheduler identity went wrong.
+    #[test]
+    fn the_backups_directory_has_one_derivation() {
+        let workdir = Path::new("/tmp/env");
+        assert_eq!(backups_dir(workdir), workdir.join("backups"));
+        let passed = reconciler_environment(
+            &environment("box1", "{}"),
+            Path::new("/tmp/gitops"),
+            Path::new("/tmp/stacks"),
+            workdir,
+        );
+        let value = passed
+            .iter()
+            .find(|(key, _)| key == "BACKUPS_DIR")
+            .and_then(|(_, value)| value.clone())
+            .expect("BACKUPS_DIR is passed to the reconciler");
+        assert_eq!(value, backups_dir(workdir).to_string_lossy());
     }
 
     /// With no backendDir configured the reconciler is materialised from the binary

@@ -52,6 +52,11 @@ jobs:
       # like one that is working until the day you need it.
       - name: backup, destroy, restore
         run: bash backends/docker/test/run-backup-test.sh
+      # There was a cron test for macOS, which CI cannot run, and none for Linux,
+      # which it can. That gap mattered once systemd units stopped being copied
+      # verbatim and started being token-rendered.
+      - name: scheduled job sync (systemd)
+        run: bash backends/docker/test/run-cron-linux-test.sh
       - name: nothing was left running
         if: always()
         run: |

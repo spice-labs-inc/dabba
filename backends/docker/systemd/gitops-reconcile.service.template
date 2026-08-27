@@ -15,6 +15,7 @@ OnFailure=__UNIT_BASE__-alert.service
 Type=oneshot
 Environment=GITOPS_DIR=__GITOPS_DIR__
 Environment=STACKS_DIR=__STACKS_DIR__
+Environment=BACKUPS_DIR=__BACKUPS_DIR__
 Environment=BOX_NAME=__BOX_NAME__
 Environment=GITOPS_APPS_DIR=__GITOPS_APPS_DIR__
 Environment=GITOPS_BRANCH=__GITOPS_BRANCH__

@@ -31,6 +31,8 @@
         <string>__GITOPS_DIR__</string>
         <key>STACKS_DIR</key>
         <string>__STACKS_DIR__</string>
+        <key>BACKUPS_DIR</key>
+        <string>__BACKUPS_DIR__</string>
         <key>BOX_NAME</key>
         <string>__BOX_NAME__</string>
         <key>GITOPS_APPS_DIR</key>

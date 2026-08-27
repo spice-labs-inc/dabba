@@ -150,6 +150,8 @@ sync_systemd_units() {
                 -e "s|__DOCKER__|$docker_bin|g" \
                 -e "s|__BACKEND_DIR__|$BACKEND_DIR|g" \
                 -e "s|__JOB_ALERT__|$JOB_ALERT_UNIT|g" \
+                -e "s|__STACKS_DIR__|$STACKS_DIR|g" \
+                -e "s|__BACKUPS_DIR__|${BACKUPS_DIR:-$HOME/backups}|g" \
                 -e "s|__APP__|$app|g" "$u" > "$rendered"
             if ! cmp -s "$rendered" "$unit_dir/$name"; then
                 cp "$rendered" "$unit_dir/$name"
@@ -216,6 +218,8 @@ sync_launchd_agents() {
                 -e "s|__DOCKER__|$docker_bin|g" \
                 -e "s|__BACKEND_DIR__|$BACKEND_DIR|g" \
                 -e "s|__JOB_ALERT__|$JOB_ALERT_UNIT|g" \
+                -e "s|__STACKS_DIR__|$STACKS_DIR|g" \
+                -e "s|__BACKUPS_DIR__|${BACKUPS_DIR:-$HOME/backups}|g" \
                 -e "s|__APP__|$app|g" "$p" > "$rendered"
             # The reconciler boots agents in and out by "gui/<uid>/<label>", so a
             # plist whose Label disagrees with its filename installs once and can

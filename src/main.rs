@@ -511,6 +511,57 @@ fn on_path(bin: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Every command the CLI offers has to appear in the docs.
+    ///
+    /// This branch added two top-level nouns, `application` and `environment`, and
+    /// listed neither — they were reachable only by running `--help` or by finding
+    /// the page that happened to mention them. Derived from the enum rather than a
+    /// hand-kept list, for the same reason every other list here is.
+    #[test]
+    fn every_command_is_listed_in_the_docs() {
+        let source = include_str!("main.rs");
+        let docs = include_str!("../docs/src/content/docs/index.mdx");
+
+        let body = source
+            .split_once("enum Command {")
+            .expect("the Command enum is declared in main.rs")
+            .1
+            .split_once("\n}\n")
+            .expect("the enum is closed")
+            .0;
+
+        let mut commands: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            // A variant is `Name,` or `Name {`, at the top level of the enum.
+            let name = line.trim_end_matches(&[',', ' ', '{'][..]);
+            if name.is_empty()
+                || !name.starts_with(|c: char| c.is_ascii_uppercase())
+                || !name.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            // clap derives the command name by lowercasing the variant.
+            commands.push(name.to_lowercase());
+        }
+        commands.sort();
+        commands.dedup();
+
+        assert!(
+            commands.len() >= 10,
+            "parsed only {commands:?} out of the Command enum; the scan broke and this \
+             test would pass vacuously"
+        );
+
+        for command in &commands {
+            assert!(
+                docs.contains(&format!("`dabba {command}")),
+                "`dabba {command}` exists but is listed nowhere in the docs index, so \
+                 the only way to find it is --help"
+            );
+        }
+    }
+
     #[test]
     fn version_compare() {
         assert!(version_lt("1.5.7", "1.6.0"));

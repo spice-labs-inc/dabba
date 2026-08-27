@@ -112,6 +112,39 @@ pub fn capture(bin: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Run and return stdout, putting the command's OWN output in the error when it
+/// fails.
+///
+/// [`capture`] throws stderr away, so a failure arrives as whatever context the
+/// caller attached and nothing else. `bao operator init` refusing to write its data
+/// directory surfaced as exactly that: "running `bao operator init`", with the
+/// actual cause — a permission error naming a path inside the container —
+/// discarded. The reconciler already captures compose's stderr for the same
+/// reason; this is that lesson on this side.
+pub fn capture_explaining_failure(bin: &str, args: &[&str]) -> Result<String> {
+    let out = Command::new(bin)
+        .args(args)
+        .output()
+        .with_context(|| format!("spawning {bin}"))?;
+    if out.status.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    // Some tools explain themselves on stdout, some on stderr. Report whatever
+    // came back rather than guessing which.
+    let mut detail = String::new();
+    for stream in [&out.stderr, &out.stdout] {
+        let text = String::from_utf8_lossy(stream);
+        if !text.trim().is_empty() {
+            detail.push_str(text.trim());
+            detail.push('\n');
+        }
+    }
+    if detail.is_empty() {
+        detail.push_str("(the command printed nothing)");
+    }
+    bail!("`{bin} {}` failed:\n{}", args.join(" "), detail.trim_end())
+}
+
 /// Run and return stdout regardless of exit status (None only if it cannot spawn).
 ///
 /// Some tools use the exit code to report state rather than failure: `bao status`
@@ -174,5 +207,31 @@ mod tests {
         let script = format!("printf '%s' {}", shell_quote(hostile));
         let seen = capture("sh", &["-c", &script]).expect("the shell ran");
         assert_eq!(seen, hostile, "quoting changed the value");
+    }
+
+    /// A failing command has to explain itself. `capture` discards stderr, so
+    /// `bao operator init` refusing to write its data directory arrived as nothing
+    /// but the caller's own context string, and the permission error naming the
+    /// path was thrown away.
+    #[test]
+    fn a_failing_command_reports_what_it_actually_said() {
+        let error = capture_explaining_failure("sh", &["-c", "echo the-real-cause >&2; exit 1"])
+            .expect_err("a non-zero exit must be an error");
+        assert!(
+            error.to_string().contains("the-real-cause"),
+            "the command's own stderr was discarded: {error}"
+        );
+
+        // Some tools explain themselves on stdout instead.
+        let error = capture_explaining_failure("sh", &["-c", "echo said-on-stdout; exit 1"])
+            .expect_err("a non-zero exit must be an error");
+        assert!(
+            error.to_string().contains("said-on-stdout"),
+            "stdout was discarded: {error}"
+        );
+
+        // And success still returns the output.
+        let ok = capture_explaining_failure("sh", &["-c", "echo fine"]).unwrap();
+        assert_eq!(ok.trim(), "fine");
     }
 }

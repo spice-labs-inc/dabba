@@ -33,6 +33,21 @@
         <string>__APP__</string>
     </array>
 
+    <!-- Where dabba put this environment stacks and where its archives go.
+         Without these the script falls back to $HOME, which is not where a
+         dabba-managed environment keeps anything. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>STACKS_DIR</key>
+        <string>__STACKS_DIR__</string>
+        <key>BACKUPS_DIR</key>
+        <string>__BACKUPS_DIR__</string>
+        <key>BACKUP_KEEP</key>
+        <string>7</string>
+        <key>BACKUP_QUIESCE</key>
+        <string>1</string>
+    </dict>
+
     <key>WorkingDirectory</key>
     <string>__STACK_DIR__</string>
 

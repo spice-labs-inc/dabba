@@ -619,6 +619,61 @@ spec:
                  so nobody can discover it"
             );
         }
+
+        // ...and the inverse, which is the direction that actually went wrong.
+        //
+        // `gitopsBranch` was documented in examples/docker-host.yaml, honoured by
+        // reconcile.sh, and never plumbed by dabba: setting it did nothing. The
+        // check above cannot see that, because it only walks knobs the code already
+        // reads. A knob nobody reads is a promise the config makes and the code
+        // does not keep.
+        let mut documented: Vec<(String, String)> = Vec::new();
+        for (file, text) in &examples {
+            let mut inside = false;
+            let mut depth = 0;
+            for line in text.lines() {
+                let indent = line.len() - line.trim_start().len();
+                if line.trim_start().starts_with("substrateConfig:") {
+                    inside = true;
+                    depth = indent;
+                    continue;
+                }
+                if !inside {
+                    continue;
+                }
+                if !line.trim().is_empty() && indent <= depth {
+                    inside = false;
+                    continue;
+                }
+                // A commented knob is still a documented one, so strip the marker.
+                let candidate = line.trim().trim_start_matches("# ").trim();
+                let Some((key, _)) = candidate.split_once(':') else {
+                    continue;
+                };
+                // Only a bare key counts; prose that happens to contain a colon
+                // ("Default `main`. A branch that...") does not.
+                if key.is_empty()
+                    || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    || !key.starts_with(|c: char| c.is_ascii_lowercase())
+                {
+                    continue;
+                }
+                documented.push((file.to_string(), key.to_string()));
+            }
+        }
+        assert!(
+            documented.len() >= 8,
+            "parsed only {} documented knobs out of the examples; the scan broke and \
+             this half would pass vacuously",
+            documented.len()
+        );
+        for (file, knob) in &documented {
+            assert!(
+                read.iter().any(|r| r == knob),
+                "{file} documents substrateConfig.{knob}, which no backend reads — \
+                 setting it would silently do nothing"
+            );
+        }
     }
 
     #[test]

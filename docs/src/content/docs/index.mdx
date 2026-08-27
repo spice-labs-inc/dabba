@@ -24,6 +24,15 @@ dabba up -c examples/local.yaml
 | `dabba down` | Tear the default environment down. |
 | `dabba doctor` | Preflight: Docker, kubectl, OpenTofu on PATH. |
 | `dabba completions <shell>` | Print a completion script (bash / zsh / fish / powershell / elvish). |
+| `dabba use <name>` | Set the default environment. |
+| `dabba config` | Validate or show the resolved config. |
+
+## Applications and versions
+
+| Command | What it does |
+|---------|--------------|
+| `dabba application render` | Render one portable definition for a substrate (also `validate`, `example`, `portability`). |
+| `dabba environment show` | The pinned toolchain and service versions (also `check`, `export`, `verify`). |
 
 ## Read
 
@@ -33,6 +42,7 @@ dabba up -c examples/local.yaml
 | `dabba diagram` | The live topology as ASCII (`--mermaid` to emit a Mermaid graph). |
 | `dabba kubeconfig` | Print the environment's kubeconfig path (`--export` for an `export` line). |
 | `dabba ls` | List configured environments and which is the default. |
+| `dabba secret ls` / `get` | Read the environment secrets from the store. |
 
 ## Environments
 

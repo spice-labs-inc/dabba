@@ -49,6 +49,7 @@ fails=0
 pass() { echo "  PASS: $1"; }
 fail() { echo "  FAIL: $1"; fails=$((fails + 1)); }
 step() { echo; echo "=== $* ==="; }
+have_docker() { docker info > /dev/null 2>&1; }
 
 # PORTABILITY: a file mode, GNU first then BSD. `stat -f` on GNU means FILESYSTEM
 # status: it ignores the format, prints filesystem information, and exits 0, so a
@@ -130,6 +131,33 @@ if [ ! -x "$DABBA" ]; then
     echo "            Build it first:  cargo build --release" >&2
     exit 1
 fi
+
+# The daemon has to be able to SEE the scratch directory.
+#
+# A snap-confined dockerd has a private /tmp: a bind mount whose source is under
+# the host /tmp resolves, inside the container, to an empty root-owned directory
+# that has nothing to do with the host path. Every stack then starts against
+# storage that is not the storage the test prepared, and OpenBao fails to
+# initialise with a permission error naming a path inside the container. That is
+# nine assertions failing, none of which mention the actual problem.
+#
+# So prove it before running anything: leave a marker in the scratch directory and
+# check a container can read it back.
+canary="$SCRATCH/.bind-canary"
+echo dabba > "$canary"
+if ! docker run --rm -v "$SCRATCH:/probe" busybox \
+        sh -c 'test -f /probe/.bind-canary' > /dev/null 2>&1; then
+    echo "CANNOT RUN: this docker daemon cannot see $SCRATCH." >&2
+    echo "            A bind mount of it resolves to an empty directory inside the" >&2
+    echo "            container, so every stack would run against the wrong storage." >&2
+    echo "            A snap-packaged dockerd does this to anything under /tmp." >&2
+    echo "            Point the scratch somewhere it can read:" >&2
+    echo >&2
+    echo "                TMPDIR=\"\$HOME/.cache/dabba-tests\" $0" >&2
+    exit 1
+fi
+rm -f "$canary"
+
 
 ###############################################################################
 step "1. a gitops seed: OpenBao, plus an application RENDERED from a definition"

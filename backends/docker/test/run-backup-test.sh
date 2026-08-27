@@ -187,7 +187,19 @@ else
     fi
 fi
 
-# --- 8. restore refuses a corrupt archive BEFORE deleting anything ----------
+# --- 8. dabba status reports the newest archive -----------------------------
+# The alert covers a FAILED run. This covers the question you actually have,
+# which is whether one ever succeeded — and it reads the same directory backup.sh
+# writes to, so a disagreement about the location shows up here.
+newest="$(ls -1 "$BACKUPS_DIR/$APP"/*.tar.gz 2>/dev/null | sort -r | head -1)"
+stamp="$(basename "$newest" .tar.gz | sed "s/^$APP-//")"
+if [ -n "$stamp" ] && printf '%s' "$stamp" | grep -qE '^[0-9]{8}T[0-9]{6}Z$'; then
+    pass "archives are named with a sortable UTC stamp status can render"
+else
+    fail "archive name $stamp is not the stamp format status parses"
+fi
+
+# --- 9. restore refuses a corrupt archive BEFORE deleting anything ----------
 printf 'not a tarball\n' > "$BACKUPS_DIR/$APP/$APP-99999999T999999Z.tar.gz"
 printf 'still-here\n' > "$STACK_DIR/data/payload"
 if bash "$RESTORE_SH" "$APP" "$BACKUPS_DIR/$APP/$APP-99999999T999999Z.tar.gz" > /dev/null 2>&1; then

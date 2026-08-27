@@ -71,6 +71,7 @@ backends/docker/
     run-test.sh                         on-host convergence smoke test (portable, side-effect-free)
     run-cron-macos-test.sh              macOS launchd cron-sync verification (self-cleaning)
     run-backup-test.sh                  backup, destroy the data, restore, assert it came back
+    run-cron-linux-test.sh              systemd scheduled-job sync: rendering, manifest, removal
 ```
 
 Desired state lives in a **separate gitops repo** (not here), laid out as:
@@ -181,7 +182,7 @@ runs the same script on the same schedule.
 
 | Knob | Default | What it decides |
 | --- | --- | --- |
-| `BACKUPS_DIR` | `~/backups` | Where archives land |
+| `BACKUPS_DIR` | `<env workdir>/backups` | Where archives land, per environment |
 | `BACKUP_KEEP` | `7` | How many to keep per app; older ones are pruned |
 | `BACKUP_QUIESCE` | `1` | Stop the stack for the copy |
 
@@ -218,6 +219,16 @@ same Slack webhook or journal entry the reconcile loop uses.
 
 Per environment rather than per box, so tearing one environment down neither
 removes alerting for the others nor orphans a unit nothing owns.
+
+### Seeing whether it is working
+
+`dabba status` reports the newest archive for each managed stack and how many are
+kept. The alert tells you when a run FAILED; this answers the question you
+actually have, which is whether one ever succeeded.
+
+Archives are per environment, beside the stacks. Two environments on one box with
+an app of the same name would otherwise write over each other, which is the same
+mistake the scheduler identity made before it was made per environment.
 
 ### The restore is the part that counts
 

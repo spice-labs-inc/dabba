@@ -34,6 +34,7 @@ RECONCILE_SH="$BACKEND_DIR/reconcile.sh"
 
 GITOPS_DIR="${GITOPS_DIR:-$HOME/dabba-gitops}"
 STACKS_DIR="${STACKS_DIR:-$HOME/stacks}"
+BACKUPS_DIR="${BACKUPS_DIR:-$HOME/backups}"
 BOX_NAME="${BOX_NAME:-$(hostname -s)}"
 GITOPS_APPS_DIR="${GITOPS_APPS_DIR:-apps}"
 GITOPS_BRANCH="${GITOPS_BRANCH:-main}"
@@ -68,6 +69,7 @@ render() {
         -e "s|__BACKEND_DIR__|$BACKEND_DIR|g" \
         -e "s|__GITOPS_DIR__|$GITOPS_DIR|g" \
         -e "s|__STACKS_DIR__|$STACKS_DIR|g" \
+        -e "s|__BACKUPS_DIR__|$BACKUPS_DIR|g" \
         -e "s|__BOX_NAME__|$BOX_NAME|g" \
         -e "s|__GITOPS_APPS_DIR__|$GITOPS_APPS_DIR|g" \
         -e "s|__GITOPS_BRANCH__|$GITOPS_BRANCH|g" \

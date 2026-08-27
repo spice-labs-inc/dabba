@@ -1748,15 +1748,27 @@ mod tests {
     /// install.sh and not the scheduled ticks. Both looked like working
     /// configuration and did nothing. Two independent derivations of the same list
     /// need a test that they agree, every time.
-    fn declared_variables(stage: &str) -> Vec<String> {
-        stage
+    /// The variables a stage declares.
+    ///
+    /// `minimum` is the point of the argument. This reads `variable "x"` out of one
+    /// file, and the sibling modules repository already keeps its variables in a
+    /// separate variables.tf — the day a stage adopts that layout this returns
+    /// nothing, and every check built on it passes by finding no work to do.
+    fn declared_variables(stage: &str, minimum: usize) -> Vec<String> {
+        let names: Vec<String> = stage
             .lines()
             .filter_map(|line| {
                 let rest = line.trim().strip_prefix("variable \"")?;
                 let name = rest.split('"').next()?;
                 Some(name.to_string())
             })
-            .collect()
+            .collect();
+        assert!(
+            names.len() >= minimum,
+            "parsed only {names:?} out of the stage; the parser broke and every check \
+             built on it would pass vacuously"
+        );
+        names
     }
 
     fn passed_variables(env: &ResolvedEnv) -> Vec<String> {
@@ -1774,7 +1786,7 @@ mod tests {
         let stage = include_str!("../../quickstart/01-cluster-scaleway/main.tf");
         let env = environment(Substrate::ScalewayKapsule, "{}");
         let passed = passed_variables(&env);
-        for declared in declared_variables(stage) {
+        for declared in declared_variables(stage, 9) {
             assert!(
                 passed.contains(&declared),
                 "quickstart/01-cluster-scaleway declares `{declared}` but cluster_vars \
@@ -1788,7 +1800,7 @@ mod tests {
         let stage = include_str!("../../quickstart/01-cluster-eks/main.tf");
         let env = environment(Substrate::Eks, "{}");
         let passed = passed_variables(&env);
-        for declared in declared_variables(stage) {
+        for declared in declared_variables(stage, 7) {
             assert!(
                 passed.contains(&declared),
                 "quickstart/01-cluster-eks declares `{declared}` but cluster_vars never \
@@ -1801,21 +1813,24 @@ mod tests {
     /// hard tofu error at apply time, which is a slow way to find a typo.
     #[test]
     fn no_variable_is_passed_that_the_stage_does_not_declare() {
-        for (substrate, stage) in [
+        for (substrate, stage, minimum) in [
             (
                 Substrate::ScalewayKapsule,
                 include_str!("../../quickstart/01-cluster-scaleway/main.tf"),
+                9,
             ),
             (
                 Substrate::Eks,
                 include_str!("../../quickstart/01-cluster-eks/main.tf"),
+                7,
             ),
             (
                 Substrate::Kind,
                 include_str!("../../quickstart/01-cluster/main.tf"),
+                2,
             ),
         ] {
-            let declared = declared_variables(stage);
+            let declared = declared_variables(stage, minimum);
             let env = environment(substrate, "{}");
             for passed in passed_variables(&env) {
                 assert!(
