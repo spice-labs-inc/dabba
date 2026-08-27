@@ -122,43 +122,6 @@ pub fn capture_including_failures(bin: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
-/// Run with `input` on stdin and return stdout (None on spawn failure or non-zero
-/// exit). The stdin counterpart of [`capture`], for a command that needs a secret
-/// off the argv `ps` exposes and whose failure really is a failure.
-pub fn capture_stdin(bin: &str, args: &[&str], input: &str) -> Option<String> {
-    use std::io::Write;
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(input.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Run with `input` on stdin and return stdout regardless of exit status.
-///
-/// The combination `capture` and `run_stdin` cannot express: a command that needs
-/// a secret on stdin AND whose non-zero exit is information rather than failure
-/// (reading a secret that does not exist yet).
-pub fn capture_stdin_including_failures(bin: &str, args: &[&str], input: &str) -> Option<String> {
-    use std::io::Write;
-    let mut child = Command::new(bin)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    child.stdin.take()?.write_all(input.as_bytes()).ok()?;
-    let out = child.wait_with_output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
 /// Spawn a detached background process (e.g. a port-forward).
 pub fn spawn(bin: &str, args: &[&str]) -> Result<Child> {
     Command::new(bin)
@@ -188,4 +151,28 @@ pub fn wait_for<F: Fn() -> bool>(desc: &str, attempts: usize, probe: F) -> Resul
 /// store, a health command out of a gitops repo.
 pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The health command the compose renderer builds is a string, spliced together
+    /// from parts that came out of a git repository and run with `bash -c` on the
+    /// box. Single quoting alone does not survive an apostrophe: the quoting ends
+    /// early and whatever follows is read as shell.
+    #[test]
+    fn a_quoted_value_cannot_break_out_of_the_command_it_is_spliced_into() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
+
+        // A substring check would be the wrong test: correct quoting still CONTAINS
+        // the dangerous text, safely inside the quotes. The only honest check is to
+        // run it. The argument the command sees must be the original value byte for
+        // byte, which it cannot be if anything else executed.
+        let hostile = "x'; touch /tmp/dabba-should-not-exist; echo '";
+        let script = format!("printf '%s' {}", shell_quote(hostile));
+        let seen = capture("sh", &["-c", &script]).expect("the shell ran");
+        assert_eq!(seen, hostile, "quoting changed the value");
+    }
 }

@@ -38,7 +38,6 @@ spec:
         - wasm32-wasip2
       tools:
         just: "1.36.0"
-        sccache: "0.8.2"
 
     # Versions of services dabba RUNS. Deliberately not restated in the
     # Application definitions that carry the image tags — that would be two lists
@@ -51,5 +50,5 @@ spec:
       # so a box and a cluster cannot quietly end up on different builds of the
       # thing that is supposed to tell you what both are doing.
       openobserve: "v0.91.0-rc3"
-      # The sccache backend behind examples/applications/cache-minio.yaml.
+      # The object store behind examples/applications/cache-minio.yaml.
       minio: "RELEASE.2024-10-13T13-34-11Z"

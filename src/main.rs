@@ -11,7 +11,6 @@
 
 mod application;
 mod backend;
-mod cache;
 mod config;
 mod edit;
 mod environment;
@@ -97,11 +96,6 @@ enum Command {
         #[command(subcommand)]
         action: EnvironmentAction,
     },
-    /// The shared CI build cache: its bucket and two scoped credentials
-    Cache {
-        #[command(subcommand)]
-        action: CacheAction,
-    },
     /// Work with portable application definitions
     Application {
         #[command(subcommand)]
@@ -169,18 +163,6 @@ enum EnvironmentAction {
         /// Directory of Application definitions
         #[arg(default_value = "examples/applications")]
         directory: PathBuf,
-    },
-}
-
-#[derive(Subcommand)]
-enum CacheAction {
-    /// Create the bucket and both scoped credentials (idempotent)
-    Up,
-    /// Print one scope's credentials as shell exports, for CI to consume
-    Credentials {
-        /// read-write (trusted branches only) or read-only (same-repo pull requests)
-        #[arg(long, default_value = "read-only")]
-        scope: String,
     },
 }
 
@@ -283,12 +265,6 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Command::Cache { action } => match action {
-            CacheAction::Up => cache::up(&cfg, None),
-            CacheAction::Credentials { scope } => {
-                cache::credentials(&cfg, None, cache::Scope::parse(&scope)?)
-            }
-        },
         Command::Application { action } => match action {
             ApplicationAction::Validate { file } => {
                 let text = std::fs::read_to_string(&file)

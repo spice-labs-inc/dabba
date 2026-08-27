@@ -117,43 +117,6 @@ kustomizations and HelmReleases; a compose host consumes
 `apps/<box>/<app>/docker-compose.yml`. Moving an environment between them is a
 migration, not a change to one line.
 
-## The CI build cache
-
-CI runs one portable entrypoint on a laptop, a GitHub runner, or a remote dabba.
-For a cache to serve all three it has to live in an object store, because
-GitHub's own cache only exists on GitHub — and a cache that starts empty on
-every ephemeral runner is not a cache at all.
-
-```bash
-dabba cache up                                    # bucket + both credentials
-dabba cache credentials --scope read-write        # trusted branches
-dabba cache credentials --scope read-only         # same-repo pull requests
-```
-
-A shared cache anyone can write to is a supply-chain problem: an untrusted pull
-request could poison an entry a later trusted build links into a release. So
-there are two credentials and the difference between them is the security
-boundary — read-write populates the cache, read-only benefits from it and cannot
-corrupt it. The root credential stays in OpenBao and never reaches CI.
-
-**Fork pull requests get neither, deliberately.** GitHub hands fork builds no
-secrets, so the only options are publishing a credential or giving them nothing.
-Publishing even a read-only key exposes every build artifact to the internet.
-Forks compile cold; that is the accepted cost.
-
-Where to run it matters more than it looks. Put the cache on the long-lived
-substrate and point CI at it; put test dependencies — a Postgres for the suite —
-on the ephemeral runner, where fresh and isolated is what you want. Same schema,
-opposite lifetimes, which is why they are separate environments rather than one:
-
-```yaml
-environments:
-  - name: ci-runner       # ephemeral, on the runner
-    substrate: docker-host
-  - name: shared-cache    # long-lived
-    substrate: scaleway-kapsule
-```
-
 ## The same versions everywhere
 
 "The same thing everywhere" is only true if something decides what the same thing

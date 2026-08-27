@@ -38,7 +38,6 @@ use crate::backend::reconciler_assets::{self, REQUIRED_SCRIPTS};
 use crate::backend::{Backend, DownOptions, Options};
 use crate::config::{DabbaConfig, ResolvedEnv};
 use crate::run;
-use crate::run::shell_quote;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -173,18 +172,6 @@ fn valid_key_value_path(path: &str) -> bool {
                     .chars()
                     .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
         })
-}
-
-/// A secret FIELD name, checked against the same charset as a path segment.
-fn field_name(name: &str) -> Result<&str> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    {
-        bail!("secret field name {name:?} is not a plain name");
-    }
-    Ok(name)
 }
 
 fn openbao_token(workdir: &Path, env_name: &str) -> Result<String> {
@@ -438,124 +425,6 @@ fn unseal_openbao(env: &ResolvedEnv, workdir: &Path) -> Result<()> {
         &format!("{key}\n"),
     )
     .context("unsealing OpenBao")
-}
-
-/// Read one field of a secret, returning it rather than printing it.
-///
-/// `secret_get` prints, because it serves a human at a terminal. Callers that need
-/// the value to do something with — the cache provisioner — need it back.
-pub fn read_secret_field(
-    config: &Path,
-    env_name: Option<&str>,
-    path: &str,
-    key: &str,
-) -> Result<String> {
-    let data = read_secret_data(config, env_name, path)?;
-    data.get(key)
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .with_context(|| format!("secret {path:?} has no field {key:?}"))
-}
-
-/// Every field of a secret, or an empty map when the secret does not exist yet.
-fn read_secret_data(
-    config: &Path,
-    env_name: Option<&str>,
-    path: &str,
-) -> Result<serde_yaml::Mapping> {
-    let cfg = DabbaConfig::load(config)?;
-    let env = cfg.resolve(env_name)?;
-    let workdir = env_workdir(config, &env.name)?;
-    let token = openbao_token(&workdir, &env.name)?;
-    if !valid_key_value_path(path) {
-        bail!("invalid secret path {path:?}");
-    }
-    let container = openbao_container()?;
-
-    // A missing secret is a normal state here (nothing has provisioned it yet), so
-    // the exit code is not treated as failure — the empty parse below handles it.
-    let script = format!(
-        "read -r BAO_TOKEN; export BAO_TOKEN BAO_ADDR=http://127.0.0.1:8200; \
-         bao kv get -format=json secret/{path} 2>/dev/null || true"
-    );
-    let output = run::capture_stdin_including_failures(
-        "docker",
-        &["exec", "-i", &container, "sh", "-c", &script],
-        &format!("{token}\n"),
-    )
-    .unwrap_or_default();
-
-    let parsed: serde_yaml::Value =
-        serde_yaml::from_str(&output).unwrap_or(serde_yaml::Value::Null);
-    Ok(parsed
-        .get("data")
-        .and_then(|d| d.get("data"))
-        .and_then(|d| d.as_mapping())
-        .cloned()
-        .unwrap_or_default())
-}
-
-/// Make sure each named field exists, generating a random value for any that does
-/// not. Fields already present are LEFT ALONE.
-///
-/// That is deliberate: reissuing a credential on every `up` would invalidate
-/// whatever CI currently holds, turning a routine re-run into an outage. Rotation
-/// has to be a separate, deliberate act.
-///
-/// `Some(value)` supplies a fixed value (an account name); `None` means generate.
-pub fn ensure_secret_fields(
-    config: &Path,
-    env_name: Option<&str>,
-    path: &str,
-    fields: &[(&str, Option<String>)],
-) -> Result<()> {
-    let existing = read_secret_data(config, env_name, path)?;
-    let mut to_write: Vec<(String, String)> = Vec::new();
-
-    for (key, fixed) in fields {
-        let present = existing
-            .get(serde_yaml::Value::String((*key).to_string()))
-            .and_then(|v| v.as_str())
-            .is_some_and(|v| !v.is_empty());
-        if present {
-            continue;
-        }
-        let value = match fixed {
-            Some(value) => value.clone(),
-            None => crate::backend::common::random_secret(24)?,
-        };
-        to_write.push(((*key).to_string(), value));
-    }
-    if to_write.is_empty() {
-        return Ok(());
-    }
-
-    // Merge rather than replace: `bao kv put` writes a whole new version, so
-    // putting only the new fields would silently drop every existing one.
-    let cfg = DabbaConfig::load(config)?;
-    let env = cfg.resolve(env_name)?;
-    let workdir = env_workdir(config, &env.name)?;
-    let token = openbao_token(&workdir, &env.name)?;
-
-    // Every field already at this path is rewritten alongside the new ones, and
-    // those values come back out of OpenBao rather than from here. A value holding
-    // an apostrophe would end the single quoting early — at best `bao kv put`
-    // fails, at worst the remainder is read as shell. Field names get the same
-    // charset rule as a path segment for the same reason.
-    let mut pairs: Vec<String> = Vec::new();
-    for (key, value) in existing.iter() {
-        let (Some(key), Some(value)) = (key.as_str(), value.as_str()) else {
-            continue;
-        };
-        pairs.push(format!("{}={}", field_name(key)?, shell_quote(value)));
-    }
-    for (key, value) in &to_write {
-        pairs.push(format!("{}={}", field_name(key)?, shell_quote(value)));
-    }
-    openbao(
-        &token,
-        &format!("bao kv put secret/{path} {}", pairs.join(" ")),
-    )
 }
 
 /// Run a `bao` command inside the OpenBao container, token on stdin.
@@ -1407,36 +1276,6 @@ mod tests {
             error.contains("does not look like backends/docker/"),
             "got: {error}"
         );
-    }
-
-    /// A secret value that already lives in OpenBao is rewritten verbatim whenever a
-    /// sibling field is added, so it reaches a shell command. Single quoting alone
-    /// does not survive an apostrophe: the quoting ends early and the remainder is
-    /// read as shell.
-    #[test]
-    fn a_secret_value_containing_a_quote_cannot_break_out_of_the_command() {
-        assert_eq!(shell_quote("plain"), "'plain'");
-        assert_eq!(shell_quote("it's"), r#"'it'\''s'"#);
-
-        let hostile = "x'; bao kv delete secret/everything; echo '";
-        let quoted = shell_quote(hostile);
-
-        // A substring check would be the wrong test here: correct quoting still
-        // CONTAINS the dangerous text, safely inside the quotes. The only honest
-        // check is to run it. The argument the command sees must be the original
-        // value byte for byte, which it cannot be if anything else executed.
-        let script = format!("printf '%s' {quoted}");
-        let seen = crate::run::capture("sh", &["-c", &script]).expect("the shell ran");
-        assert_eq!(seen, hostile, "quoting changed the value");
-    }
-
-    #[test]
-    fn a_field_name_must_be_a_plain_name() {
-        assert!(field_name("root-password").is_ok());
-        assert!(field_name("readwrite.access_key").is_ok());
-        for bad in ["", "a b", "a;b", "a/b", "a'b", "a$b"] {
-            assert!(field_name(bad).is_err(), "{bad:?} should be rejected");
-        }
     }
 
     /// The path is interpolated into a shell command inside the container, so a

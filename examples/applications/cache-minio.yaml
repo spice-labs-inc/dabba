@@ -1,19 +1,20 @@
-# The sccache backend, as a portable Application.
+# An object store, as a portable Application.
 #
-# This is the first thing in dabba written once and deployed to whichever
-# substrate suits it, so it is also the honest test of whether the intersection
-# schema is big enough to be useful for real infrastructure rather than test
-# fixtures. Render it either way:
+# MinIO is a real piece of infrastructure with a port, persistent storage and a
+# credential, so this is the honest test of whether the intersection schema is big
+# enough for something beyond a test fixture. It is also the definition a build
+# cache would be built on: dabba deploys the store, and whatever wants a cache
+# provisions its buckets and credentials on top. Render it either way:
 #
 #     dabba application render examples/applications/cache-minio.yaml \
 #       --substrate docker-host        # a compose stack on a box
 #     dabba application render examples/applications/cache-minio.yaml \
 #       --substrate scaleway-kapsule   # a Deployment, Service, claim and ExternalSecret
 #
-# WHERE THIS SHOULD RUN, and why it is not a matter of taste: a cache is only
-# worth operating if it outlives the thing using it. Started on an ephemeral CI
-# runner it begins empty, every run misses, and you pay to run a cache that never
-# has anything in it. Put this on the long-lived substrate and point CI at it.
+# WHERE THIS SHOULD RUN, and why it is not a matter of taste: a store used as a
+# cache is only worth operating if it outlives the thing using it. Started on an
+# ephemeral CI runner it begins empty, every run misses, and you pay to run a cache
+# that never has anything in it. Put this on the long-lived substrate.
 #
 # Test dependencies — a Postgres for the suite to talk to — want the opposite:
 # fresh and isolated per run, on the runner. Same schema, opposite lifetime.

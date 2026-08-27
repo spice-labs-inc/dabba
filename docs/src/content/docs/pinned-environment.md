@@ -15,7 +15,6 @@ spec:
         - wasm32-wasip2
       tools:
         just: "1.36.0"
-        sccache: "0.8.2"
     services:
       postgres: "16"
       openbao: "2.1.0"

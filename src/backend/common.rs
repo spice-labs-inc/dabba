@@ -93,12 +93,6 @@ pub fn read_stash(workdir: &Path, name: &str) -> String {
         .unwrap_or_default()
 }
 
-/// OS randomness as a lowercase hex string, for callers that need a VALUE rather
-/// than a file — credentials that live in OpenBao rather than the local stash.
-pub fn random_secret(nbytes: usize) -> Result<String> {
-    random_token(nbytes)
-}
-
 /// `nbytes` of OS randomness as a lowercase hex string. Bails if `/dev/urandom`
 /// can't be read — a silent all-zeros token would be a catastrophic secret.
 fn random_token(nbytes: usize) -> Result<String> {

@@ -13,7 +13,7 @@
 #       --substrate kind               # Deployment, Service, claim, ExternalSecret
 #
 # STORAGE: local disk, via the volume below. OpenObserve can also write to an S3
-# endpoint — the MinIO that `dabba cache up` provisions is one — but that is a
+# endpoint — the MinIO in examples/applications/cache-minio.yaml is one — but that
 # different set of environment variables and a different failure mode, so it is a
 # deliberate second step rather than a default that half-works.
 apiVersion: dabba.spicelabs.io/v1alpha1
