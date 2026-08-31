@@ -1,0 +1,58 @@
+# A managed Kubernetes cluster on Scaleway Kapsule.
+#
+#     dabba env cloud up -c examples/scaleway.yaml
+#
+# Credentials come from the environment (SCW_ACCESS_KEY, SCW_SECRET_KEY,
+# SCW_DEFAULT_PROJECT_ID) or ~/.config/scw/config.yaml. They are deliberately not
+# config fields: a credential in a config file is a credential in git, and one
+# passed as a terraform variable is written into the state file.
+#
+# THIS PROVISIONS BILLABLE CLOUD RESOURCES. node_type times node_count is what the
+# cluster costs, and `maxNodeCount` is the ceiling if autoscaling is on.
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: DabbaConfig
+metadata:
+  name: dabba
+spec:
+  # A domain you control and can delegate. Kapsule also issues a per-cluster
+  # wildcard, which is enough to reach a Gateway before delegation is done.
+  domain: example.test
+
+  tls:
+    # Switch to acme once the domain resolves to the cluster; until then a
+    # self-signed CA avoids burning ACME rate limits on a name that does not
+    # answer yet.
+    issuer: selfsigned
+
+  defaultEnvironment: cloud
+
+  environments:
+    - name: cloud
+      substrate: scaleway-kapsule
+      substrateConfig:
+        # Control plane region: fr-par, nl-ams or pl-waw.
+        region: fr-par
+
+        # Node pool zone. Must be INSIDE the region above — Scaleway rejects a
+        # mismatch at apply rather than at plan, so a wrong pair costs a failed
+        # provisioning run rather than a fast error.
+        zone: fr-par-1
+
+        # dabba's floor is 1.31: the external-secrets CRDs use selectableFields.
+        k8sVersion: "1.31"
+
+        # The smallest type that fits dabba's platform set (Flux, Forgejo,
+        # cert-manager, Envoy Gateway, OpenBao) with room for workloads. Smaller
+        # types schedule and then evict under load, which presents as pods
+        # restarting for no visible reason.
+        nodeType: PRO2-XXS
+        nodeCount: "2"
+
+        # Off by default. When on, the pool scales between nodeCount and
+        # maxNodeCount, and maxNodeCount is the ceiling on what this can cost.
+        autoscaling: "false"
+        maxNodeCount: "4"
+
+        # Kapsule requires a private network; empty provisions a dedicated one.
+        # Set it to place the cluster alongside existing Scaleway resources.
+        # privateNetworkId: ""

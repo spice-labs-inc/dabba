@@ -1,0 +1,69 @@
+# OpenBao as a reconciled stack — the compose-host equivalent of the OpenBao that
+# the Kubernetes substrate runs in-cluster, and the thing that makes secret-backed
+# environment variables work on a bare box.
+#
+# File storage, not `-dev`. A dev-mode server keeps everything in memory, so every
+# restart silently empties the vault; that is fine for a demo and actively
+# dangerous as the thing holding a box's credentials.
+#
+# The cost of real storage is that a fresh server starts sealed and must be
+# initialised and unsealed. `dabba env <name> up` does both and stashes the unseal
+# key and root token in the environment's working directory at 0600 — for the same
+# reason the Kubernetes path stashes them there: the key to the vault cannot live
+# inside the vault it opens.
+#
+# Bound to loopback. This is a secret store for stacks on this box, and every one
+# of them reaches it over the compose network, not the host port. The published
+# port exists so `dabba secret get` and the operator can reach it locally.
+services:
+  openbao:
+    image: openbao/openbao:2.1.0
+    # Just `server`, with no -config. The image's entrypoint already passes
+    # -config=/openbao/config, so naming the file explicitly loads the same
+    # listener stanza twice and the second bind fails with "address already in
+    # use" — a crash loop whose message points nowhere near the cause.
+    command: server
+    # The server runs as uid 100, and its data is a bind mount created by the
+    # reconciler as the host user — mode 755 under the common umask, which uid 100
+    # cannot write. So it runs as the host user instead; the reconciler puts
+    # DABBA_UID/DABBA_GID in the stack .env. Without this `bao operator init` fails
+    # with a permission error naming a path inside the container, and every stack
+    # that needs a secret fails behind it.
+    user: "${DABBA_UID:-0}:${DABBA_GID:-0}"
+    ports:
+      - "127.0.0.1:8220:8200"
+    volumes:
+      - type: bind
+        source: ./data
+        target: /openbao/data
+    restart: unless-stopped
+    configs:
+      - source: openbao-config
+        target: /openbao/config/config.hcl
+
+configs:
+  openbao-config:
+    content: |
+      ui = false
+      storage "file" {
+        path = "/openbao/data"
+      }
+      listener "tcp" {
+        address     = "0.0.0.0:8200"
+        tls_disable = true
+      }
+      # A single-box store: no HA, and no cluster address to advertise.
+      #
+      # No disable_mlock line: OpenBao 2.x dropped mlock support and REFUSES to
+      # start if the key is present at all, in either state. Its replacement
+      # guidance is to disable or encrypt swap on the host instead, which is a
+      # host concern rather than something this file can express.
+# The reconciler's health gate. A sealed OpenBao is running but useless, so this
+# asks for a 200 from /sys/health — which OpenBao returns only when initialised
+# AND unsealed, answering 501 or 503 otherwise. That is the same
+# deployed-versus-working distinction the readiness probe draws on Kubernetes.
+#
+# One line, deliberately. A YAML block scalar puts the command on the following
+# lines where the reconciler cannot read it; it now refuses those rather than
+# silently passing, but this has to be readable in the first place.
+x-health-cmd: docker run --rm --network gitops-openbao_default curlimages/curl:latest -fsS --max-time 5 http://openbao:8200/v1/sys/health >/dev/null 2>&1

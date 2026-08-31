@@ -14,9 +14,119 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --all
+
+  # The reconciler is bash, so it gets the same treatment the Rust gets: a linter
+  # that fails the build, and its tests run on every push rather than by hand.
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: shellcheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y shellcheck
+          shellcheck -S warning \
+            backends/docker/*.sh \
+            backends/docker/test/*.sh \
+            hack/*.sh \
+            hack/local-test/*.sh
+
+  # The reconciler's own tests. Unlike the quickstart e2e — which needs a kind
+  # cluster and public repos, and so runs on a schedule — this needs only the
+  # Docker the ubuntu runner already has, which is cheap enough to gate every
+  # pull request.
+  reconciler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - name: convergence and failure handling
+        run: bash backends/docker/test/run-convergence-test.sh
+      - name: deploy, no-op, redeploy
+        run: bash backends/docker/test/run-test.sh
+      # The restore is the reason this gates every pull request. An archive nobody
+      # unpacks is a hypothesis, and a backup that stopped working looks exactly
+      # like one that is working until the day you need it.
+      - name: backup, destroy, restore
+        run: bash backends/docker/test/run-backup-test.sh
+      # There was a cron test for macOS, which CI cannot run, and none for Linux,
+      # which it can. That gap mattered once systemd units stopped being copied
+      # verbatim and started being token-rendered.
+      - name: scheduled job sync (systemd)
+        run: bash backends/docker/test/run-cron-linux-test.sh
+      - name: nothing was left running
+        if: always()
+        run: |
+          left="$(docker ps -aq --filter 'name=gitops-' | wc -l)"
+          if [ "$left" != "0" ]; then
+            echo "::error::the reconciler tests left $left container(s) behind"
+            docker ps -a --filter 'name=gitops-'
+            exit 1
+          fi
+          echo "no gitops-* containers left behind"
+
+  # What the Kubernetes renderer emits must be something a real API server would
+  # accept. Validated against the published Kubernetes schemas rather than a
+  # cluster, so it gates every pull request instead of needing one — and it
+  # catches the realistic failure, which is the renderer emitting a wrong type or
+  # a field that does not exist.
+  rendered-manifests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      # The exhaustive fixture AND every shipped example. The fixture exercises
+      # every field; real examples combine them in ways it does not, which is how
+      # the escape-hatch merge bug was found.
+      - name: render everything for both substrates
+        run: |
+          mkdir -p /tmp/render /tmp/stack
+          ./target/release/dabba application example > /tmp/exhaustive.yaml
+          for f in /tmp/exhaustive.yaml examples/applications/*.yaml; do
+            name="$(basename "$f" .yaml)"
+            ./target/release/dabba application validate "$f"
+            ./target/release/dabba application render "$f" \
+              --substrate kind > "/tmp/render/$name-kubernetes.yaml"
+            ./target/release/dabba application render "$f" \
+              --substrate docker-host > "/tmp/stack/$name-compose.yml"
+          done
+      - name: every Kubernetes rendering validates against real schemas
+        run: |
+          # ExternalSecret is a CRD, so the built-in schemas do not cover it and
+          # -strict treats that as an error. Point kubeconform at the published
+          # schema for it rather than skipping the kind: the whole value of this
+          # step is that what the renderer emits is something a real API server
+          # would accept, and a skipped kind is one nothing checks.
+          docker run --rm -v /tmp/render:/work ghcr.io/yannh/kubeconform:latest \
+            -strict -summary -kubernetes-version 1.31.0 \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
+            /work
+      - name: every compose rendering is something docker compose accepts
+        run: |
+          for f in /tmp/stack/*-compose.yml; do
+            dir="$(mktemp -d)"; cp "$f" "$dir/docker-compose.yml"
+            ( cd "$dir" && docker compose config > /dev/null ) \
+              || { echo "::error::$f is not a valid compose file"; exit 1; }
+          done
+
+  # The pinned environment is only real if something checks it. This checks the
+  # half that does not need the toolchain installed: that every Application tag
+  # and every hand-written compose stack agrees with spec.environment.services.
+  pinned-environment:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: shipped artifacts agree with the pinned service versions
+        run: ./target/release/dabba environment verify -c examples/local.yaml
 
   # Dependency advisories, license policy, banned/duplicate crates, source allow-list.
   cargo-deny:

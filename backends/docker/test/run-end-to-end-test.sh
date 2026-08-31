@@ -1,0 +1,339 @@
+#!/usr/bin/env bash
+#
+# End-to-end test for the docker-host substrate, at parity with what
+# hack/local-test/in-vm.sh asserts for kind/k3d/minikube.
+#
+# The Kubernetes end-to-end proves one thing above all: an application serves a
+# value that came out of the secret store. That is the contract this mirrors —
+# not "up returned zero", but "a real request returned a real secret".
+#
+# The arc:
+#   1. `dabba env <name> up` against a local gitops seed, from a directory with
+#      NO backends/docker/ in it, so the embedded reconciler is what runs;
+#   2. OpenBao converges, and dabba initialises and unseals it;
+#   3. a secret is written, and an application whose compose file was RENDERED
+#      from a portable Application definition picks it up by reference;
+#   4. the application serves that secret over HTTP;
+#   5. the reconcile loop converges a change without anyone touching the box;
+#   6. `dabba env <name> down` stops the loop and LEAVES THE STACKS RUNNING.
+#
+# Step 6 is where this deliberately diverges from the Kubernetes test. There,
+# `down` destroys the cluster and the test asserts it is gone. Here the
+# never-destroy contract means the correct assertion is the opposite: the loop
+# is gone AND the stacks are still up. Asserting "down worked" without checking
+# which of those two happened would pass for entirely the wrong reason.
+#
+# Self-cleaning: every container, LaunchAgent, systemd unit and directory this
+# creates is removed on exit, and the removal is verified rather than assumed.
+set -uo pipefail
+
+REPO_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+DABBA="${DABBA:-$REPO_ROOT/target/release/dabba}"
+
+ENVIRONMENT="dabbae2e"
+BOX="dabbae2ebox"
+APP="secretconsumer"
+APP_PROJECT="gitops-$APP"
+OPENBAO_PROJECT="gitops-openbao"
+PORT="18093"
+SECRET_VALUE="delivered through dabba"
+
+SCRATCH="$(mktemp -d "${TMPDIR:-/tmp}/dabba-e2e.XXXXXX")"
+# Deliberately NOT the repo: `up` must find the reconciler inside the binary.
+WORKROOT="$SCRATCH/elsewhere"
+CONFIG="$WORKROOT/dabba.yaml"
+SEED="$SCRATCH/gitops-seed"
+WORKDIR="$WORKROOT/.dabba/$ENVIRONMENT"
+
+fails=0
+pass() { echo "  PASS: $1"; }
+fail() { echo "  FAIL: $1"; fails=$((fails + 1)); }
+step() { echo; echo "=== $* ==="; }
+have_docker() { docker info > /dev/null 2>&1; }
+
+# PORTABILITY: a file mode, GNU first then BSD. `stat -f` on GNU means FILESYSTEM
+# status: it ignores the format, prints filesystem information, and exits 0, so a
+# BSD-first fallback never reaches the GNU form on Linux. Both mode checks below
+# were comparing a multi-line filesystem blob against "600" and reporting a
+# correctly-locked-down file as wrong.
+file_mode() {
+    mode="$(stat -c '%a' "$1" 2>/dev/null)"
+    case "$mode" in ''|*[!0-7]*) mode="$(stat -f '%Lp' "$1" 2>/dev/null)" ;; esac
+    printf '%s' "$mode"
+}
+
+cleanup() {
+    step "cleanup"
+    if [ -f "$CONFIG" ] && [ -x "$DABBA" ]; then
+        "$DABBA" env "$ENVIRONMENT" down -c "$CONFIG" > /dev/null 2>&1
+    fi
+    # The loop again, directly, in case `down` itself is what broke.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        launchctl bootout "gui/$(id -u)/io.spicelabs.dabba.reconcile.$ENVIRONMENT" > /dev/null 2>&1
+        rm -f "$HOME/Library/LaunchAgents/io.spicelabs.dabba.reconcile.$ENVIRONMENT.plist"
+        rm -f "$HOME/Library/Logs/dabba/reconcile-$ENVIRONMENT.log"
+    else
+        systemctl --user disable --now "gitops-reconcile-$ENVIRONMENT.timer" > /dev/null 2>&1
+        rm -f "$HOME/.config/systemd/user/gitops-reconcile-$ENVIRONMENT."*
+        systemctl --user daemon-reload > /dev/null 2>&1
+    fi
+
+    for project in "$APP_PROJECT" "$OPENBAO_PROJECT"; do
+        ids="$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null)"
+        if [ -n "$ids" ]; then
+            # shellcheck disable=SC2086  # deliberate word splitting over ids
+            docker rm -f $ids > /dev/null 2>&1
+        fi
+        docker network rm "${project}_default" > /dev/null 2>&1
+    done
+    # Containers write into the stacks as their own uid, so some of what they
+    # leave behind is not deletable by the user who started them — MinIO does
+    # exactly this. Remove those from inside a container first, then take the rest
+    # normally. Without this the test passes and still leaves a directory the
+    # person who ran it cannot delete.
+    if have_docker; then
+        docker run --rm -v "$SCRATCH:/scratch" busybox \
+            sh -c 'rm -rf /scratch/* /scratch/.[!.]* 2>/dev/null' > /dev/null 2>&1
+    fi
+    rm -rf "$SCRATCH"
+
+    # Prove it, rather than trusting the removals above.
+    residue=""
+    for project in "$APP_PROJECT" "$OPENBAO_PROJECT"; do
+        [ -n "$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null)" ] \
+            && residue="$residue $project"
+    done
+    if [ "$(uname -s)" = "Darwin" ] && launchctl print "gui/$(id -u)/io.spicelabs.dabba.reconcile.$ENVIRONMENT" > /dev/null 2>&1; then
+        residue="$residue launchagent"
+    fi
+    [ -d "$SCRATCH" ] && residue="$residue scratch-dir"
+    if [ -n "$residue" ]; then
+        echo "  WARNING: residue survived cleanup:$residue"
+    else
+        echo "  nothing left behind: no containers, no scheduler unit, no directories"
+    fi
+}
+trap cleanup EXIT
+
+# Not being able to run is a FAILURE here, not a skip.
+#
+# This is the gate a person runs by hand before merging a change to up, down, the
+# reconciler or secrets — it cannot run in CI, which has no user session. Exiting
+# 0 because the setup was missing meant running it, seeing success, and believing
+# the change had been exercised when nothing had run at all. A gate that passes
+# by not running is worse than no gate.
+if ! docker info > /dev/null 2>&1; then
+    echo "CANNOT RUN: needs a running docker daemon." >&2
+    exit 1
+fi
+if [ ! -x "$DABBA" ]; then
+    echo "CANNOT RUN: no dabba binary at $DABBA." >&2
+    echo "            Build it first:  cargo build --release" >&2
+    exit 1
+fi
+
+# The daemon has to be able to SEE the scratch directory.
+#
+# A snap-confined dockerd has a private /tmp: a bind mount whose source is under
+# the host /tmp resolves, inside the container, to an empty root-owned directory
+# that has nothing to do with the host path. Every stack then starts against
+# storage that is not the storage the test prepared, and OpenBao fails to
+# initialise with a permission error naming a path inside the container. That is
+# nine assertions failing, none of which mention the actual problem.
+#
+# So prove it before running anything: leave a marker in the scratch directory and
+# check a container can read it back.
+canary="$SCRATCH/.bind-canary"
+echo dabba > "$canary"
+if ! docker run --rm -v "$SCRATCH:/probe" busybox \
+        sh -c 'test -f /probe/.bind-canary' > /dev/null 2>&1; then
+    echo "CANNOT RUN: this docker daemon cannot see $SCRATCH." >&2
+    echo "            A bind mount of it resolves to an empty directory inside the" >&2
+    echo "            container, so every stack would run against the wrong storage." >&2
+    echo "            A snap-packaged dockerd does this to anything under /tmp." >&2
+    echo "            Point the scratch somewhere it can read:" >&2
+    echo >&2
+    echo "                TMPDIR=\"\$HOME/.cache/dabba-tests\" $0" >&2
+    exit 1
+fi
+rm -f "$canary"
+
+
+###############################################################################
+step "1. a gitops seed: OpenBao, plus an application RENDERED from a definition"
+###############################################################################
+mkdir -p "$WORKROOT" "$SEED/apps/$BOX/openbao" "$SEED/apps/$BOX/$APP"
+
+cp "$REPO_ROOT/backends/docker/examples/openbao/docker-compose.yml" \
+   "$SEED/apps/$BOX/openbao/docker-compose.yml"
+
+# The application is written ONCE, portably, and rendered for this substrate.
+# That is the whole claim: the same definition would render for Kubernetes.
+cat > "$SCRATCH/application.yaml" <<YAML
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: Application
+metadata:
+  name: $APP
+spec:
+  image: hashicorp/http-echo
+  tag: "1.0"
+  ports:
+    - name: http
+      containerPort: 5678
+      publish: $PORT
+  environment:
+    - name: ECHO_TEXT
+      secret:
+        name: demo
+        key: message
+  dockerHost:
+    # http-echo takes its body as a flag; this is what the escape hatch is for.
+    command: ["-listen=:5678", "-text=\$ECHO_TEXT"]
+YAML
+
+"$DABBA" application validate "$SCRATCH/application.yaml" || fail "definition did not validate"
+"$DABBA" application render "$SCRATCH/application.yaml" --substrate docker-host \
+    > "$SEED/apps/$BOX/$APP/docker-compose.yml" \
+    || fail "rendering for docker-host failed"
+
+grep -q 'x-secrets' "$SEED/apps/$BOX/$APP/docker-compose.yml" \
+    && pass "rendered stack carries a secret reference" \
+    || fail "rendered stack has no x-secrets block"
+grep -q "$SECRET_VALUE" "$SEED/apps/$BOX/$APP/docker-compose.yml" \
+    && fail "THE SECRET VALUE IS IN A FILE HEADED FOR GIT" \
+    || pass "rendered stack contains the reference, not the value"
+
+# The same definition must render for Kubernetes too, or portability is a claim.
+"$DABBA" application render "$SCRATCH/application.yaml" --substrate kind \
+    > "$SCRATCH/kubernetes.yaml" 2>/dev/null \
+    && grep -q 'kind: Deployment' "$SCRATCH/kubernetes.yaml" \
+    && pass "the same definition also renders for Kubernetes" \
+    || fail "the same definition did not render for Kubernetes"
+
+git init -q "$SEED"
+git -C "$SEED" config user.email dabba-e2e@localhost
+git -C "$SEED" config user.name "dabba e2e"
+git -C "$SEED" checkout -q -b main
+git -C "$SEED" add -A
+git -C "$SEED" commit -q -m "openbao + $APP"
+
+cat > "$CONFIG" <<YAML
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: DabbaConfig
+metadata:
+  name: dabba
+spec:
+  domain: localtest.me
+  defaultEnvironment: $ENVIRONMENT
+  environments:
+    - name: $ENVIRONMENT
+      substrate: docker-host
+      substrateConfig:
+        boxName: $BOX
+YAML
+
+###############################################################################
+step "2. up, from a directory with no backends/docker/ in it"
+###############################################################################
+( cd "$WORKROOT" && "$DABBA" env "$ENVIRONMENT" up -c "$CONFIG" --gitops-seed "$SEED" ) 2>&1 \
+    | sed 's/^/  | /'
+
+[ -f "$WORKDIR/reconciler/reconcile.sh" ] \
+    && pass "the reconciler was materialised from the binary" \
+    || fail "no materialised reconciler — an installed dabba could not have run"
+
+###############################################################################
+step "3. OpenBao is initialised and unsealed"
+###############################################################################
+[ -s "$WORKDIR/openbao-root" ] && pass "a root token was stashed" \
+    || fail "no root token stashed"
+[ -s "$WORKDIR/openbao-unseal" ] && pass "an unseal key was stashed" \
+    || fail "no unseal key stashed"
+if [ "$(file_mode "$WORKDIR/openbao-root")" = "600" ]; then
+    pass "the root token is 0600"
+else
+    fail "the root token is not 0600"
+fi
+
+bao_container="$(docker ps -q --filter "label=com.docker.compose.project=$OPENBAO_PROJECT" --filter status=running | head -1)"
+if [ -n "$bao_container" ]; then
+    sealed="$(docker exec "$bao_container" sh -c 'BAO_ADDR=http://127.0.0.1:8200 bao status -format=json' 2>/dev/null | grep -o '"sealed": *[a-z]*' | head -1)"
+    echo "$sealed" | grep -q 'false' && pass "OpenBao reports itself unsealed" \
+        || fail "OpenBao is still sealed ($sealed)"
+else
+    fail "no OpenBao container is running"
+fi
+
+###############################################################################
+step "4. write a secret, let the loop deliver it, and read it back over HTTP"
+###############################################################################
+if [ -n "$bao_container" ]; then
+    docker exec -i "$bao_container" sh -c \
+        "read -r T; BAO_ADDR=http://127.0.0.1:8200 BAO_TOKEN=\$T bao kv put secret/demo message='$SECRET_VALUE'" \
+        < "$WORKDIR/openbao-root" > /dev/null 2>&1 \
+        && pass "secret written to OpenBao" || fail "could not write the secret"
+fi
+
+# Drive a reconcile directly rather than waiting on the minute timer.
+GITOPS_DIR="$WORKDIR/gitops" STACKS_DIR="$WORKDIR/stacks" BOX_NAME="$BOX" \
+  DABBA_ENVIRONMENT="$ENVIRONMENT" OPENBAO_TOKEN_FILE="$WORKDIR/openbao-root" \
+  /bin/bash "$WORKDIR/reconciler/reconcile.sh" 2>&1 | sed 's/^/  | /'
+
+if [ -f "$WORKDIR/stacks/$APP/.env" ]; then
+    grep -q "ECHO_TEXT=$SECRET_VALUE" "$WORKDIR/stacks/$APP/.env" \
+        && pass "the reconciler resolved the reference into the stack's .env" \
+        || fail "the .env does not carry the resolved secret"
+    perms="$(file_mode "$WORKDIR/stacks/$APP/.env")"
+    [ "$perms" = "600" ] && pass "the resolved .env is 0600" || fail "the .env is $perms, not 0600"
+else
+    fail "no .env was written for $APP"
+fi
+
+# THE assertion, and the one the Kubernetes end-to-end makes too.
+body=""
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    body="$(curl -fsS --max-time 3 "http://127.0.0.1:${PORT}/" 2>/dev/null)"
+    [ -n "$body" ] && break
+    sleep 2
+done
+echo "  response: ${body:-<empty>}"
+if echo "$body" | grep -q "$SECRET_VALUE"; then
+    pass "THE APPLICATION SERVES THE VALUE THAT CAME OUT OF OPENBAO"
+else
+    fail "the application did not serve the OpenBao-backed value"
+fi
+
+###############################################################################
+step "5. down stops the loop and LEAVES THE STACKS RUNNING"
+###############################################################################
+( cd "$WORKROOT" && "$DABBA" env "$ENVIRONMENT" down -c "$CONFIG" ) 2>&1 | sed 's/^/  | /'
+
+if [ "$(uname -s)" = "Darwin" ]; then
+    if launchctl print "gui/$(id -u)/io.spicelabs.dabba.reconcile.$ENVIRONMENT" > /dev/null 2>&1; then
+        fail "the reconcile loop is still installed after down"
+    else
+        pass "the reconcile loop was removed"
+    fi
+fi
+
+# Distinguish "down destroyed it" from "it never started": both leave nothing
+# running, and reporting a broken never-destroy contract for a stack that never
+# came up would send the next person hunting the wrong bug.
+still_running="$(docker ps -q --filter "label=com.docker.compose.project=$APP_PROJECT" --filter status=running | head -1)"
+ever_existed="$(docker ps -aq --filter "label=com.docker.compose.project=$APP_PROJECT" | head -1)"
+if [ -n "$still_running" ]; then
+    pass "the stack is STILL RUNNING (never-destroy contract honoured)"
+elif [ -z "$ever_existed" ]; then
+    fail "the stack never started, so the never-destroy contract was not exercised"
+else
+    fail "down tore the stack down; the never-destroy contract was broken"
+fi
+
+###############################################################################
+echo
+if [ "$fails" -eq 0 ]; then
+    echo "=== ALL ASSERTIONS PASSED ==="
+else
+    echo "=== $fails ASSERTION(S) FAILED ==="
+fi
+exit "$fails"

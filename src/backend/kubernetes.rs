@@ -1,8 +1,14 @@
-//! `dabba up`/`down`/`status`/`kubeconfig` — the per-environment lifecycle. `up` is
-//! the day-0 bootstrap: provision the substrate, install Forgejo + the Flux Operator,
-//! seed the gitops content into Forgejo, seed the demo secret into OpenBao, and wait
-//! for the platform to settle. Each env runs in its own `.dabba/<env>/` working dir.
+//! `KubernetesBackend` — dabba's original day-0 lifecycle, now behind the
+//! `Backend` trait. `up` provisions the substrate (tofu), installs Forgejo + the
+//! Flux Operator, seeds the gitops content into Forgejo and the demo secret into
+//! OpenBao, then waits for the platform to settle; `down`/`status`/`diagram`/
+//! `secret ls`/`secret get` read or tear down that same environment. Every env runs
+//! in its own `.dabba/<env>/` working dir. This is a faithful extraction of the
+//! former `up.rs`: the flow is unchanged, only the backend-neutral helpers moved to
+//! `backend::common`.
 
+use crate::backend::common::{env_secret, env_workdir, expand_tilde, log, on_path, read_stash};
+use crate::backend::{Backend, DownOptions, Options};
 use crate::config::{DabbaConfig, Exposure, Issuer, ResolvedEnv, Substrate};
 use crate::run;
 use anyhow::{bail, Context, Result};
@@ -10,17 +16,28 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub struct Options {
-    pub config: PathBuf,
-    /// Which environment to act on; None → the config's default.
-    pub env: Option<String>,
-    pub quickstart_dir: PathBuf,
-    /// Override module sources: a local path (dev) → `<path>/modules/<substrate>`;
-    /// None → the public git ref.
-    pub modules_source: Option<String>,
-    /// Local gitops content to seed Forgejo from (air-gapped/dev). None → clone the
-    /// config's git.upstream.
-    pub gitops_seed: Option<PathBuf>,
+/// The original tofu/Flux flow. Selected for every substrate except `docker-host`.
+pub struct KubernetesBackend;
+
+impl Backend for KubernetesBackend {
+    fn up(&self, opts: &Options) -> Result<()> {
+        run(opts)
+    }
+    fn down(&self, opts: &DownOptions) -> Result<()> {
+        down(opts)
+    }
+    fn status(&self, config: &Path, env_name: Option<&str>) -> Result<()> {
+        status(config, env_name)
+    }
+    fn diagram(&self, config: &Path, env_name: Option<&str>, mermaid: bool) -> Result<()> {
+        diagram(config, env_name, mermaid)
+    }
+    fn secret_ls(&self, config: &Path, env_name: Option<&str>, path: Option<&str>) -> Result<()> {
+        secret_ls(config, env_name, path)
+    }
+    fn secret_get(&self, config: &Path, env_name: Option<&str>, name: &str) -> Result<()> {
+        secret_get(config, env_name, name)
+    }
 }
 
 const FORGEJO_USER: &str = "dabba";
@@ -134,18 +151,6 @@ pub fn run(opts: &Options) -> Result<()> {
     Ok(())
 }
 
-/// `<config dir>/.dabba/<env>` — the per-env working dir (tofu state + kubeconfig).
-fn env_workdir(config: &Path, env_name: &str) -> Result<PathBuf> {
-    let base = config
-        .canonicalize()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let dir = base.join(".dabba").join(env_name);
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
-}
-
 /// Copy a quickstart stage template into the per-env workdir, overwriting the .tf
 /// but leaving any existing state/.terraform in place.
 fn copy_stage(src: &Path, dest: &Path) -> Result<()> {
@@ -158,11 +163,6 @@ fn copy_stage(src: &Path, dest: &Path) -> Result<()> {
             &dest.display().to_string(),
         ],
     )
-}
-
-pub struct DownOptions {
-    pub config: PathBuf,
-    pub env: Option<String>,
 }
 
 /// `dabba down` — the inverse of `up`. For a provisioned substrate, destroy the
@@ -423,50 +423,6 @@ fn write_askpass() -> Result<PathBuf> {
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700));
     }
     Ok(path)
-}
-
-/// Read-or-generate a per-env secret stashed in the workdir (0600). Reused across
-/// re-ups so the value is stable for the life of the env. `complex` adds a fixed
-/// upper/digit/special suffix to satisfy app password policies (e.g. OpenObserve).
-fn env_secret(workdir: &Path, name: &str, complex: bool) -> Result<String> {
-    let path = workdir.join(name);
-    if let Ok(existing) = std::fs::read_to_string(&path) {
-        let existing = existing.trim().to_string();
-        if !existing.is_empty() {
-            return Ok(existing);
-        }
-    }
-    // The entropy is in the hex; the suffix only satisfies complexity policies.
-    let val = if complex {
-        format!("{}Aa1!", random_token(24)?)
-    } else {
-        random_token(24)?
-    };
-    std::fs::write(&path, &val).with_context(|| format!("writing {}", path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-    }
-    Ok(val)
-}
-
-/// Read a stashed per-env secret (empty string if absent) — for `down`, which must
-/// not generate.
-fn read_stash(workdir: &Path, name: &str) -> String {
-    std::fs::read_to_string(workdir.join(name))
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
-}
-
-/// `nbytes` of OS randomness as a lowercase hex string. Bails if `/dev/urandom`
-/// can't be read — a silent all-zeros token would be a catastrophic secret.
-fn random_token(nbytes: usize) -> Result<String> {
-    use std::io::Read;
-    let mut buf = vec![0u8; nbytes];
-    let mut f = std::fs::File::open("/dev/urandom").context("opening /dev/urandom")?;
-    f.read_exact(&mut buf).context("reading /dev/urandom")?;
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// `dabba status` — for the given env: is it deployed, and how is Flux reconciling?
@@ -777,30 +733,6 @@ fn bao(token: &str, cmd: &str) -> Result<()> {
     )
 }
 
-/// `dabba ls` — list the configured environments and which one is the default.
-pub fn ls(config: &Path) -> Result<()> {
-    let cfg = DabbaConfig::load(config)?;
-    let default = cfg.default_env_name().ok();
-    for env in &cfg.spec.environments {
-        let marker = if Some(env.name.as_str()) == default {
-            "*"
-        } else {
-            " "
-        };
-        let deployed = env_workdir(config, &env.name)
-            .ok()
-            .map(|w| w.join("01-cluster").join(".terraform").is_dir() || env.kubeconfig.is_some())
-            .unwrap_or(false);
-        println!(
-            "{marker} {:<16} {:?}{}",
-            env.name,
-            env.substrate,
-            if deployed { "  (deployed)" } else { "" }
-        );
-    }
-    Ok(())
-}
-
 /// `dabba diagram` — the visual half of `status`: render the env's live topology
 /// (Flux Kustomizations + HelmReleases with health) as Mermaid (default) or ASCII.
 pub fn diagram(config: &Path, env_name: Option<&str>, mermaid: bool) -> Result<()> {
@@ -952,20 +884,6 @@ fn render_mermaid(env: &ResolvedEnv, ksts: &[(String, bool)], hrs: &[(String, bo
     if !bad.is_empty() {
         println!("  class {} bad;", bad.join(","));
     }
-}
-
-/// `dabba env <name>` (no verb) — show the env's resolved config.
-pub fn show(config: &Path, env_name: &str) -> Result<()> {
-    let cfg = DabbaConfig::load(config)?;
-    let env = cfg.resolve(Some(env_name))?;
-    println!("name:       {}", env.name);
-    println!("substrate:  {:?}", env.substrate);
-    println!("domain:     {}", env.domain);
-    println!("issuer:     {:?}", env.issuer);
-    if let Some(kc) = &env.kubeconfig {
-        println!("kubeconfig: {kc}");
-    }
-    Ok(())
 }
 
 /// The kubeconfig for an env: the BYO path for `existing`, else the per-env
@@ -1623,9 +1541,12 @@ fn substrate_dir(s: Substrate) -> Result<&'static str> {
         Substrate::K3d => "k3d",
         Substrate::Minikube => "minikube",
         Substrate::Eks => "eks-fargate",
-        Substrate::ScalewayKapsule => bail!("the scaleway substrate (Tier 1) is not built yet"),
+        Substrate::ScalewayKapsule => "scaleway-kapsule",
         // Existing is handled before this is called (no provisioning module).
         Substrate::Existing => bail!("existing substrate has no provisioning module"),
+        // Unreachable on the k8s path: a docker-host env dispatches to the
+        // DockerBackend (see backend::select) and never enters this flow.
+        Substrate::DockerHost => bail!("docker-host is served by the docker backend, not tofu"),
     })
 }
 
@@ -1634,6 +1555,7 @@ fn substrate_dir(s: Substrate) -> Result<&'static str> {
 fn cluster_stage(s: Substrate) -> &'static str {
     match s {
         Substrate::Eks => "01-cluster-eks",
+        Substrate::ScalewayKapsule => "01-cluster-scaleway",
         _ => "01-cluster",
     }
 }
@@ -1667,6 +1589,44 @@ fn cluster_vars(env: &ResolvedEnv) -> Vec<String> {
             hcl_list(&env.substrate_list("publicSubnetIds"))
         ));
     }
+    if env.substrate == Substrate::ScalewayKapsule {
+        v.push(format!(
+            "-var=region={}",
+            env.substrate_str("region", "fr-par")
+        ));
+        // The pool's zone must sit inside the cluster's region. Scaleway rejects a
+        // mismatch at apply rather than at plan, so a wrong pair costs a failed
+        // provisioning run rather than a fast error.
+        v.push(format!(
+            "-var=zone={}",
+            env.substrate_str("zone", "fr-par-1")
+        ));
+        v.push(format!(
+            "-var=k8s_version={}",
+            env.substrate_str("k8sVersion", "1.31")
+        ));
+        v.push(format!(
+            "-var=node_type={}",
+            env.substrate_str("nodeType", "PRO2-XXS")
+        ));
+        v.push(format!(
+            "-var=node_count={}",
+            env.substrate_str("nodeCount", "2")
+        ));
+        v.push(format!(
+            "-var=autoscaling={}",
+            env.substrate_str("autoscaling", "false")
+        ));
+        v.push(format!(
+            "-var=max_node_count={}",
+            env.substrate_str("maxNodeCount", "4")
+        ));
+        // Empty provisions a dedicated private network; Kapsule requires one.
+        v.push(format!(
+            "-var=private_network_id={}",
+            env.substrate_str("privateNetworkId", "")
+        ));
+    }
     v
 }
 
@@ -1678,16 +1638,6 @@ fn hcl_list(items: &[String]) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("[{inner}]")
-}
-
-/// Expand a leading `~/` to $HOME; otherwise pass through unchanged.
-fn expand_tilde(p: &str) -> PathBuf {
-    if let Some(rest) = p.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(p)
 }
 
 fn issuer_name(i: Issuer) -> &'static str {
@@ -1765,11 +1715,6 @@ fn module_name_in(line: &str) -> Option<String> {
     Some(name.to_string())
 }
 
-fn on_path(bin: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(bin).is_file()))
-}
-
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1777,6 +1722,158 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn log(msg: &str) {
-    eprintln!("▸ {msg}");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Exposure, Issuer};
+
+    fn environment(substrate: Substrate, substrate_config: &str) -> ResolvedEnv {
+        ResolvedEnv {
+            name: "cloud".to_string(),
+            substrate,
+            kubeconfig: None,
+            domain: "example.test".to_string(),
+            issuer: Issuer::Selfsigned,
+            exposure: Exposure::Nodeport,
+            acme_email: String::new(),
+            substrate_config: serde_yaml::from_str(substrate_config).unwrap(),
+        }
+    }
+
+    /// Every variable a 01-cluster stage DECLARES must actually be passed by
+    /// cluster_vars, or the knob exists in the template and nothing ever sets it.
+    ///
+    /// This is the third outing for this pattern. `appsDir` was honoured by the
+    /// installer and dropped by the unit templates; OPENBAO_TOKEN_FILE reached
+    /// install.sh and not the scheduled ticks. Both looked like working
+    /// configuration and did nothing. Two independent derivations of the same list
+    /// need a test that they agree, every time.
+    /// The variables a stage declares.
+    ///
+    /// `minimum` is the point of the argument. This reads `variable "x"` out of one
+    /// file, and the sibling modules repository already keeps its variables in a
+    /// separate variables.tf — the day a stage adopts that layout this returns
+    /// nothing, and every check built on it passes by finding no work to do.
+    fn declared_variables(stage: &str, minimum: usize) -> Vec<String> {
+        let names: Vec<String> = stage
+            .lines()
+            .filter_map(|line| {
+                let rest = line.trim().strip_prefix("variable \"")?;
+                let name = rest.split('"').next()?;
+                Some(name.to_string())
+            })
+            .collect();
+        assert!(
+            names.len() >= minimum,
+            "parsed only {names:?} out of the stage; the parser broke and every check \
+             built on it would pass vacuously"
+        );
+        names
+    }
+
+    fn passed_variables(env: &ResolvedEnv) -> Vec<String> {
+        cluster_vars(env)
+            .iter()
+            .filter_map(|arg| {
+                let rest = arg.strip_prefix("-var=")?;
+                Some(rest.split('=').next()?.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_scaleway_stage_variable_is_passed() {
+        let stage = include_str!("../../quickstart/01-cluster-scaleway/main.tf");
+        let env = environment(Substrate::ScalewayKapsule, "{}");
+        let passed = passed_variables(&env);
+        for declared in declared_variables(stage, 9) {
+            assert!(
+                passed.contains(&declared),
+                "quickstart/01-cluster-scaleway declares `{declared}` but cluster_vars \
+                 never passes it, so the knob would silently take its template default"
+            );
+        }
+    }
+
+    #[test]
+    fn every_eks_stage_variable_is_passed() {
+        let stage = include_str!("../../quickstart/01-cluster-eks/main.tf");
+        let env = environment(Substrate::Eks, "{}");
+        let passed = passed_variables(&env);
+        for declared in declared_variables(stage, 7) {
+            assert!(
+                passed.contains(&declared),
+                "quickstart/01-cluster-eks declares `{declared}` but cluster_vars never \
+                 passes it"
+            );
+        }
+    }
+
+    /// And the inverse: a variable passed to a stage that does not declare it is a
+    /// hard tofu error at apply time, which is a slow way to find a typo.
+    #[test]
+    fn no_variable_is_passed_that_the_stage_does_not_declare() {
+        for (substrate, stage, minimum) in [
+            (
+                Substrate::ScalewayKapsule,
+                include_str!("../../quickstart/01-cluster-scaleway/main.tf"),
+                9,
+            ),
+            (
+                Substrate::Eks,
+                include_str!("../../quickstart/01-cluster-eks/main.tf"),
+                7,
+            ),
+            (
+                Substrate::Kind,
+                include_str!("../../quickstart/01-cluster/main.tf"),
+                2,
+            ),
+        ] {
+            let declared = declared_variables(stage, minimum);
+            let env = environment(substrate, "{}");
+            for passed in passed_variables(&env) {
+                assert!(
+                    declared.contains(&passed),
+                    "{substrate:?} passes `-var={passed}` but its stage does not declare \
+                     it; tofu rejects that at apply"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn scaleway_selects_its_own_module_and_stage() {
+        assert_eq!(
+            substrate_dir(Substrate::ScalewayKapsule).unwrap(),
+            "scaleway-kapsule"
+        );
+        assert_eq!(
+            cluster_stage(Substrate::ScalewayKapsule),
+            "01-cluster-scaleway"
+        );
+        // It is a cloud substrate, so the teardown path removes cloud load
+        // balancers and DNS records before destroying the cluster.
+        assert!(is_cloud(Substrate::ScalewayKapsule));
+    }
+
+    #[test]
+    fn scaleway_config_overrides_reach_the_stage() {
+        let env = environment(
+            Substrate::ScalewayKapsule,
+            "{ region: nl-ams, zone: nl-ams-2, nodeType: GP1-XS, nodeCount: '5' }",
+        );
+        let vars = cluster_vars(&env);
+        assert!(vars.contains(&"-var=region=nl-ams".to_string()));
+        assert!(vars.contains(&"-var=zone=nl-ams-2".to_string()));
+        assert!(vars.contains(&"-var=node_type=GP1-XS".to_string()));
+        assert!(vars.contains(&"-var=node_count=5".to_string()));
+    }
+
+    /// A local substrate must not pick up cloud knobs it has no variables for.
+    #[test]
+    fn local_substrates_pass_only_the_cluster_name() {
+        let env = environment(Substrate::Kind, "{ region: nl-ams }");
+        assert_eq!(cluster_vars(&env), vec!["-var=cluster_name=cloud"]);
+    }
 }

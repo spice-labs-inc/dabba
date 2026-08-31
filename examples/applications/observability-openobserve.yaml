@@ -1,0 +1,92 @@
+# OpenObserve — logs, metrics and traces — as a portable Application.
+#
+# This closes the observability gap on `substrate: docker-host`. `spec.observability`
+# drives the Kubernetes reconcile layer and is not consumed on a compose host, so a
+# box had nowhere for its telemetry to go. OpenObserve is a single binary with one
+# port and one data directory, which is exactly the shape the portable schema
+# describes, so it does not need to be a substrate feature at all — it is just an
+# application, deployed the same way as any other.
+#
+#     dabba application render examples/applications/observability-openobserve.yaml \
+#       --substrate docker-host        # a compose stack on a box
+#     dabba application render examples/applications/observability-openobserve.yaml \
+#       --substrate kind               # Deployment, Service, claim, ExternalSecret
+#
+# STORAGE: local disk, via the volume below. OpenObserve can also write to an S3
+# endpoint — the MinIO in examples/applications/cache-minio.yaml is one — but that
+# different set of environment variables and a different failure mode, so it is a
+# deliberate second step rather than a default that half-works.
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: Application
+metadata:
+  name: openobserve
+
+spec:
+  image: public.ecr.aws/zinclabs/openobserve
+  # Pinned, and the same version the Kubernetes platform layer runs, so a box and a
+  # cluster are not quietly on different builds. `dabba environment verify` reports
+  # a tag that disagrees with the pinned environment.
+  tag: v0.91.0-rc3
+
+  ports:
+    - name: http
+      containerPort: 5080
+      # Published so the UI is reachable on a box, which has no Gateway in front of
+      # it. On Kubernetes this is the Service port and the Gateway routes to it.
+      publish: 5080
+
+  environment:
+    - name: ZO_ROOT_USER_EMAIL
+      value: admin@dabba.local
+    # Resolved from the same OpenBao path on both substrates: the reconciler writes
+    # it into the stack .env on a box, and the generated ExternalSecret populates a
+    # Secret on Kubernetes. No shipped default — an observability backend with a
+    # known password is a public one.
+    - name: ZO_ROOT_USER_PASSWORD
+      secret:
+        name: dabba/openobserve
+        key: password
+    - name: ZO_DATA_DIR
+      value: /data
+
+  volumes:
+    - name: data
+      mountPath: /data
+
+  # Readiness, not liveness. A backend that is up but not yet serving should stop
+  # receiving telemetry, not be restarted underneath the data it is opening.
+  healthCheck:
+    httpGet:
+      path: /healthz
+      port: http
+    initialDelaySeconds: 10
+    periodSeconds: 15
+
+  resources:
+    cpu: "1"
+    memory: 1Gi
+
+  kubernetes:
+    spec:
+      template:
+        spec:
+          # The image runs as uid 2000 and needs the volume group-owned to match.
+          securityContext:
+            fsGroup: 2000
+          containers:
+            - name: openobserve
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 2000
+                allowPrivilegeEscalation: false
+                capabilities:
+                  drop: ["ALL"]
+                seccompProfile:
+                  type: RuntimeDefault
+              # A request as well as the portable limit, so the scheduler has
+              # something to place. Requests are Kubernetes-only: compose has no
+              # scheduler to reserve against.
+              resources:
+                requests:
+                  cpu: 100m
+                  memory: 256Mi

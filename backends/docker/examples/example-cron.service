@@ -1,0 +1,29 @@
+# EXAMPLE Linux scheduled-job systemd USER service, shipped by a stack at
+# <box>/<app>/systemd/<app>-<job>.service (paired with the .timer beside it).
+# reconcile.sh's sync_systemd_units() installs it verbatim into
+# ~/.config/systemd/user/. Unlike the macOS launchd plists these are NOT
+# token-rendered the same way the launchd plists are: __BACKEND_DIR__ and __APP__
+# below are substituted by the reconciler before install.
+#
+# This one is the real nightly backup: it runs the backup.sh that dabba
+# materialises next to the reconciler, so a stack gets working backups by
+# shipping two small files rather than by writing a backup implementation.
+#
+# OnFailure= is what makes a failing backup different from an absent one. Without
+# it both are silence, and silence is what you get for months before you find out.
+[Unit]
+Description=example-app nightly backup (dabba gitops cron)
+OnFailure=__JOB_ALERT__%n.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash __BACKEND_DIR__/backup.sh __APP__
+# Matches the reconciler's own defaults; set them here to override per stack.
+# Where dabba put this environment stacks and where its archives go. Without
+# these the script falls back to $HOME, which is not where a dabba-managed
+# environment keeps anything.
+Environment=STACKS_DIR=__STACKS_DIR__
+Environment=BACKUPS_DIR=__BACKUPS_DIR__
+Environment=BACKUP_KEEP=7
+Environment=BACKUP_QUIESCE=1
+TimeoutStartSec=30min

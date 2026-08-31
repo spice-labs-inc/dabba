@@ -63,6 +63,14 @@ pub struct Spec {
     pub alerting: Alerting, // [R]
     #[serde(default)]
     pub use_cases: Vec<String>, // [R]
+    /// The pinned environment: toolchain and service versions that a laptop, CI
+    /// and the cloud all resolve to. Consumed by `dabba environment`, not by any
+    /// substrate — a pin that varied per environment would not be a pin.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::environment::Environment::is_empty"
+    )]
+    pub environment: crate::environment::Environment,
 }
 
 /// One environment: a named managed boundary. The `name` is its identity — it is
@@ -94,6 +102,22 @@ pub enum Substrate {
     Eks,
     /// Bring-your-own: skip provisioning and configure the cluster `kubeconfig` points at.
     Existing,
+    /// A bare-OS host that runs `docker compose` instead of Kubernetes. Selects the
+    /// `DockerBackend` (the gitops reconciler under `backends/docker/`) rather than
+    /// the tofu/Flux `KubernetesBackend`.
+    ///
+    /// NOTE ON THE SELECTOR SHAPE. The reconciler README sketched a separate
+    /// `runtime: kubernetes | docker` field alongside `substrate:`. We fold the
+    /// choice into `substrate` instead — as a new `docker-host` value — because it
+    /// is the single-source-of-truth design: `substrate` already IS "what this env
+    /// runs on", and one field makes contradictory states (e.g. `runtime: docker`
+    /// with `substrate: eks`) unrepresentable, so no cross-field validation is
+    /// needed. It also keeps `ResolvedEnv.substrate` a plain (non-optional)
+    /// `Substrate`, so none of the k8s code that matches on it has to learn about an
+    /// orthogonal runtime — the backend is picked by the substrate alone. The k8s
+    /// path never receives this variant (the `DockerBackend` is dispatched first),
+    /// so the k8s substrate handling is behavior-preserving.
+    DockerHost,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -505,6 +529,151 @@ spec:
             cfg.resolve(Some("byo")).unwrap().substrate,
             Substrate::Existing
         );
+    }
+
+    #[test]
+    fn parses_and_resolves_docker_host() {
+        // A docker-host env parses, validates (domain inherited from spec), and
+        // resolves with substrate=DockerHost — the selector the DockerBackend keys on.
+        let cfg_text = LOCAL.replace(
+            "- { name: minikube, substrate: minikube }",
+            "- { name: box1, substrate: docker-host, substrateConfig: { boxName: testbox } }",
+        );
+        let cfg: DabbaConfig = serde_yaml::from_str(&cfg_text).unwrap();
+        cfg.validate().unwrap();
+        let env = cfg.resolve(Some("box1")).unwrap();
+        assert_eq!(env.substrate, Substrate::DockerHost);
+        assert_eq!(env.substrate_str("boxName", ""), "testbox");
+        assert_eq!(env.domain, "localtest.me"); // inherited from spec.domain
+    }
+
+    /// Every substrateConfig knob the code reads must appear in at least one
+    /// shipped example, and every knob an example sets must be read by something.
+    ///
+    /// Three knobs have now shipped documented-but-unwired or wired-but-
+    /// undocumented — appsDir, OPENBAO_TOKEN_FILE and gitopsBranch. The pattern is
+    /// always the same: two lists maintained by different hands, drifting. This
+    /// derives both from source, so the drift fails the build instead of surfacing
+    /// in someone's deployment.
+    #[test]
+    fn every_substrate_knob_is_both_read_and_documented() {
+        let sources = [
+            include_str!("backend/docker.rs"),
+            include_str!("backend/kubernetes.rs"),
+        ];
+        let examples: Vec<(&str, &str)> = vec![
+            ("local.yaml", include_str!("../examples/local.yaml")),
+            ("eks.yaml", include_str!("../examples/eks.yaml")),
+            ("existing.yaml", include_str!("../examples/existing.yaml")),
+            (
+                "docker-host.yaml",
+                include_str!("../examples/docker-host.yaml"),
+            ),
+            ("scaleway.yaml", include_str!("../examples/scaleway.yaml")),
+        ];
+
+        // Knobs the code reads: substrate_str("name", ...) / substrate_list("name")
+        let mut read: Vec<String> = Vec::new();
+        for source in sources {
+            for accessor in ["substrate_str(\"", "substrate_list(\""] {
+                let mut rest = source;
+                while let Some(index) = rest.find(accessor) {
+                    rest = &rest[index + accessor.len()..];
+                    if let Some(end) = rest.find('"') {
+                        let name = &rest[..end];
+                        if !name.is_empty() && !read.iter().any(|r| r == name) {
+                            read.push(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            read.len() >= 10,
+            "found only {} knobs in the backends; the scan broke and this test would \
+             pass vacuously",
+            read.len()
+        );
+
+        // Knobs an example mentions, commented-out lines included: a commented knob
+        // is still a documented one, and still has to be real.
+        let mentioned = |knob: &str| {
+            examples
+                .iter()
+                .any(|(_, text)| text.contains(&format!("{knob}:")))
+        };
+
+        // `backendDir` is a development override for driving a working copy of the
+        // reconciler; it is documented in backends/docker/README.md rather than in
+        // an example, because putting it in one would suggest it belongs in a real
+        // config.
+        const DOCUMENTED_ELSEWHERE: &[&str] = &["backendDir"];
+
+        for knob in &read {
+            if DOCUMENTED_ELSEWHERE.contains(&knob.as_str()) {
+                continue;
+            }
+            assert!(
+                mentioned(knob),
+                "substrateConfig.{knob} is read by the code but appears in no example, \
+                 so nobody can discover it"
+            );
+        }
+
+        // ...and the inverse, which is the direction that actually went wrong.
+        //
+        // `gitopsBranch` was documented in examples/docker-host.yaml, honoured by
+        // reconcile.sh, and never plumbed by dabba: setting it did nothing. The
+        // check above cannot see that, because it only walks knobs the code already
+        // reads. A knob nobody reads is a promise the config makes and the code
+        // does not keep.
+        let mut documented: Vec<(String, String)> = Vec::new();
+        for (file, text) in &examples {
+            let mut inside = false;
+            let mut depth = 0;
+            for line in text.lines() {
+                let indent = line.len() - line.trim_start().len();
+                if line.trim_start().starts_with("substrateConfig:") {
+                    inside = true;
+                    depth = indent;
+                    continue;
+                }
+                if !inside {
+                    continue;
+                }
+                if !line.trim().is_empty() && indent <= depth {
+                    inside = false;
+                    continue;
+                }
+                // A commented knob is still a documented one, so strip the marker.
+                let candidate = line.trim().trim_start_matches("# ").trim();
+                let Some((key, _)) = candidate.split_once(':') else {
+                    continue;
+                };
+                // Only a bare key counts; prose that happens to contain a colon
+                // ("Default `main`. A branch that...") does not.
+                if key.is_empty()
+                    || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                    || !key.starts_with(|c: char| c.is_ascii_lowercase())
+                {
+                    continue;
+                }
+                documented.push((file.to_string(), key.to_string()));
+            }
+        }
+        assert!(
+            documented.len() >= 8,
+            "parsed only {} documented knobs out of the examples; the scan broke and \
+             this half would pass vacuously",
+            documented.len()
+        );
+        for (file, knob) in &documented {
+            assert!(
+                read.iter().any(|r| r == knob),
+                "{file} documents substrateConfig.{knob}, which no backend reads — \
+                 setting it would silently do nothing"
+            );
+        }
     }
 
     #[test]

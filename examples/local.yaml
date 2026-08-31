@@ -20,3 +20,35 @@ spec:
     enabled: false # Vector -> OpenObserve (+ OTEL traces); opt-in, off by default
   useCases:
     - demo
+
+  # The pinned environment. One place that decides which versions a laptop, a CI
+  # runner and a cloud box all resolve to — the thing that makes "the same thing
+  # everywhere" true rather than aspirational.
+  #
+  #   dabba environment show     the pins, and how this machine compares
+  #   dabba environment check    exits non-zero on drift (a pin nobody checks is
+  #                              a comment)
+  #   dabba environment export   shell exports, for a workflow to eval
+  #   dabba environment verify   Application tags that disagree with a service pin
+  environment:
+    # What must be INSTALLED to build. Nothing deploys these; they are checked.
+    toolchain:
+      rust: "1.83.0"
+      rustTargets:
+        - wasm32-wasip2
+      tools:
+        just: "1.36.0"
+
+    # Versions of services dabba RUNS. Deliberately not restated in the
+    # Application definitions that carry the image tags — that would be two lists
+    # drifting apart, which is the bug this codebase keeps producing. This is the
+    # authority; `dabba environment verify` reports any definition that disagrees.
+    services:
+      postgres: "16"
+      openbao: "2.1.0"
+      # The observability backend, shipped as a portable Application. Pinned here
+      # so a box and a cluster cannot quietly end up on different builds of the
+      # thing that is supposed to tell you what both are doing.
+      openobserve: "v0.91.0-rc3"
+      # The object store behind examples/applications/cache-minio.yaml.
+      minio: "RELEASE.2024-10-13T13-34-11Z"

@@ -57,13 +57,83 @@ The config ships three local environments (`kind`/`k3d`/`minikube`); `dabba ls` 
 
 | Layer | Default | Change it with |
 |-------|---------|----------------|
-| Provisioning | kind / k3d / minikube; bring-your-own or managed cloud | `substrate:` |
+| Provisioning | kind / k3d / minikube; bring-your-own or managed cloud; or a bare box running docker compose | `substrate:` |
 | GitOps | FluxCD, syncing from an in-cluster git server | — |
 | Gateway | Envoy Gateway (Gateway API) | a gitops component |
 | TLS | cert-manager, self-signed CA locally (ACME in the cloud) | `tls.issuer:` |
 | Secrets | External Secrets + [OpenBao](https://openbao.org/), per-env random | `secrets.backend:` |
 | Observability | Vector → OpenObserve + an OTel collector (opt-in) | `observability:` |
 | Demo | [podinfo](https://github.com/stefanprodan/podinfo) | `useCases:` |
+
+## Without Kubernetes
+
+Not every deployment earns a cluster. `substrate: docker-host` runs on a plain
+box with Docker on it — no Kubernetes, no control plane, no API server. A
+per-box loop pulls the gitops repository every minute and converges the host's
+`docker compose` stacks to it, which is the same idea Flux implements, minus the
+cluster it needs to run in.
+
+```bash
+dabba env box up -c examples/docker-host.yaml --gitops-seed ./my-gitops
+```
+
+The trade is explicit. You give up scheduling, self-healing beyond restart
+policies, multi-node anything, and a cluster's worth of primitives. You get a
+resource floor of "your containers, plus a shell script that runs for a second a
+minute", and one fewer distributed system to operate. Losing the loop degrades
+to "no new deploys" rather than an outage, because Docker's restart policy is
+the supervisor — the reconciler only ever delivers change.
+
+`down` reflects that: it stops the loop and leaves your stacks running.
+Decommissioning is a deliberate act, not a side effect of turning off the thing
+that deploys.
+
+## One application, either substrate
+
+An application is written once and rendered for whichever substrate it lands on:
+
+```bash
+dabba application example > app.yaml
+dabba application render app.yaml --substrate kind          # Kubernetes objects
+dabba application render app.yaml --substrate docker-host   # a compose file
+```
+
+The shared schema is the **intersection** of what both runtimes genuinely
+honour, not the union. A field that cannot render meaningfully on both sides is
+not in the schema at all, and a conformance test fails the build if either
+renderer stops honouring one — so a field cannot quietly work on one substrate
+and do nothing on the other.
+
+Some things are genuinely substrate-specific, and those go in explicit
+`kubernetes:` and `dockerHost:` blocks. `dabba application portability` reports
+which of them a given substrate will ignore, rather than dropping them silently.
+
+Some things are permanently out of scope because no compose equivalent exists:
+autoscaling, NetworkPolicy, PodDisruptionBudgets, multi-node scheduling, service
+mesh. Those are named in the schema so their absence reads as a decision.
+
+**Gitops content itself is not portable.** A Kubernetes substrate consumes
+kustomizations and HelmReleases; a compose host consumes
+`apps/<box>/<app>/docker-compose.yml`. Moving an environment between them is a
+migration, not a change to one line.
+
+## The same versions everywhere
+
+"The same thing everywhere" is only true if something decides what the same thing
+*is*. `spec.environment` pins the toolchain a build needs and the versions of the
+services the platform runs:
+
+```bash
+dabba environment show     # the pins, and how this machine compares
+dabba environment check    # exits non-zero on drift
+dabba environment verify   # artifacts whose tags disagree with a service pin
+```
+
+Service versions are **not** restated in the pin — they already live in the tag of
+an Application or the `image:` line of a compose stack. Restating them would make
+two lists maintained by different hands, which is the bug this codebase has
+produced most often. The pin is the authority and `verify` reports anything that
+disagrees, so drift is caught rather than duplicated.
 
 ## How it fits together
 

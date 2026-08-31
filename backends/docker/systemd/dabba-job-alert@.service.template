@@ -1,0 +1,23 @@
+# Failure alert for a per-app scheduled job. A job unit shipped in gitops content
+# activates it with:
+#
+#     [Unit]
+#     OnFailure=__JOB_ALERT__%n.service
+#
+# The reconciler renders __JOB_ALERT__ to this environment's instance of this
+# unit, so a job in git names it without knowing which environment it landed in.
+# %n is the failing unit's own name, which arrives here as %i.
+#
+# Per environment rather than per box: one shared unit would mean tearing down
+# one environment either removes alerting for the others or leaves a unit behind
+# that nothing owns.
+#
+# Installed as a systemd USER unit by install.sh, which renders __BACKEND_DIR__.
+[Unit]
+Description=dabba scheduled job failure alert for %i
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash __BACKEND_DIR__/reconcile-alert.sh %i
+EnvironmentFile=-%h/.dabba-reconcile.env
+TimeoutStartSec=5min

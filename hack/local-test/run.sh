@@ -3,8 +3,10 @@
 # local copies of all three repos — no GitHub, no pushing.
 #
 # Usage:
-#   ./run.sh [--substrate kind|k3d|minikube] [--keep|--reuse]
-#     --substrate   local cluster to provision (default kind). Each gets its own VM.
+#   ./run.sh [--substrate kind|k3d|minikube|docker-host] [--keep|--reuse]
+#     --substrate   what to run on (default kind). Each gets its own VM.
+#                   docker-host is the bare-OS compose path: no cluster at all,
+#                   so the VM installs only docker and runs the reconciler.
 #     --keep        leave the VM running afterwards
 #     --reuse       reuse the existing VM (warm cache; faster). Implies --keep.
 set -euo pipefail

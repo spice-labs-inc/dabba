@@ -1,0 +1,86 @@
+# An object store, as a portable Application.
+#
+# MinIO is a real piece of infrastructure with a port, persistent storage and a
+# credential, so this is the honest test of whether the intersection schema is big
+# enough for something beyond a test fixture. It is also the definition a build
+# cache would be built on: dabba deploys the store, and whatever wants a cache
+# provisions its buckets and credentials on top. Render it either way:
+#
+#     dabba application render examples/applications/cache-minio.yaml \
+#       --substrate docker-host        # a compose stack on a box
+#     dabba application render examples/applications/cache-minio.yaml \
+#       --substrate scaleway-kapsule   # a Deployment, Service, claim and ExternalSecret
+#
+# WHERE THIS SHOULD RUN, and why it is not a matter of taste: a store used as a
+# cache is only worth operating if it outlives the thing using it. Started on an
+# ephemeral CI runner it begins empty, every run misses, and you pay to run a cache
+# that never has anything in it. Put this on the long-lived substrate.
+#
+# Test dependencies — a Postgres for the suite to talk to — want the opposite:
+# fresh and isolated per run, on the runner. Same schema, opposite lifetime.
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: Application
+metadata:
+  name: cache
+spec:
+  image: minio/minio
+  # Pinned rather than :latest. A cache backend that silently changes version
+  # underneath a running CI fleet is a bad afternoon.
+  tag: RELEASE.2024-10-13T13-34-11Z
+
+  ports:
+    - name: api
+      containerPort: 9000
+      publish: 9000
+
+  environment:
+    # Both resolved from the secret store rather than written here: this file
+    # goes into a git repository. On a compose host the reconciler resolves them
+    # into the stack's own .env each tick; on Kubernetes they become a
+    # secretKeyRef. One declaration, two mechanisms.
+    - name: MINIO_ROOT_USER
+      secret:
+        name: cache
+        key: root-user
+    - name: MINIO_ROOT_PASSWORD
+      secret:
+        name: cache
+        key: root-password
+
+  volumes:
+    - name: data
+      mountPath: /data
+
+  # A cache that answers its port but cannot serve objects is worse than one that
+  # is plainly down, because CI treats it as available and stalls on every miss.
+  # MinIO's live endpoint checks the object layer, not just the listener.
+  healthCheck:
+    httpGet:
+      path: /minio/health/live
+      port: api
+    initialDelaySeconds: 10
+    periodSeconds: 15
+
+  resources:
+    cpu: "1"
+    memory: 1Gi
+
+  dockerHost:
+    # MinIO needs the data directory as an argument; there is no environment
+    # variable for it. Exactly what the escape hatch is for.
+    command: ["server", "/data"]
+    # Its data is a bind mount the reconciler creates as the host user, mode 755
+    # under the common umask, and this image does not run as that user. Running as
+    # the owning uid is what lets it write at all — and it is also what keeps the
+    # files removable afterwards, rather than leaving a directory behind that the
+    # person who created it cannot delete. Kubernetes needs none of this: the
+    # volume is a claim, and the kubelet handles ownership.
+    user: "${DABBA_UID:-0}:${DABBA_GID:-0}"
+
+  kubernetes:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: cache
+              args: ["server", "/data"]

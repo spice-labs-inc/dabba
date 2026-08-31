@@ -9,10 +9,13 @@
 //!   config: config validate | show
 //!   shell:  completions <shell>
 
+mod application;
+mod backend;
 mod config;
 mod edit;
+mod environment;
+mod render;
 mod run;
-mod up;
 
 use anyhow::{Context, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
@@ -88,6 +91,16 @@ enum Command {
     },
     /// Preflight checks (docker / tools / cluster reachable)
     Doctor,
+    /// The pinned toolchain and service versions, and whether this machine matches
+    Environment {
+        #[command(subcommand)]
+        action: EnvironmentAction,
+    },
+    /// Work with portable application definitions
+    Application {
+        #[command(subcommand)]
+        action: ApplicationAction,
+    },
     /// Manage the dabba config
     Config {
         #[command(subcommand)]
@@ -138,6 +151,49 @@ enum SecretAction {
 }
 
 #[derive(Subcommand)]
+enum EnvironmentAction {
+    /// Print the pins and how this machine compares
+    Show,
+    /// Exit non-zero if this machine does not match the pins
+    Check,
+    /// Print the pins as shell exports, for a workflow or shell to eval
+    Export,
+    /// Report Application definitions whose tag disagrees with a service pin
+    Verify {
+        /// Directory of Application definitions
+        #[arg(default_value = "examples/applications")]
+        directory: PathBuf,
+    },
+}
+
+#[derive(Subcommand)]
+enum ApplicationAction {
+    /// Validate an application definition against the portable schema
+    Validate {
+        /// Path to the Application YAML
+        file: PathBuf,
+    },
+    /// Print a starter definition exercising every portable field
+    Example,
+    /// Render a definition for a substrate (compose file, or Kubernetes objects)
+    Render {
+        /// Path to the Application YAML
+        file: PathBuf,
+        /// Substrate to render for (any Kubernetes substrate, or docker-host)
+        #[arg(long, default_value = "docker-host")]
+        substrate: String,
+    },
+    /// Report which parts of a definition a given substrate will NOT honour
+    Portability {
+        /// Path to the Application YAML
+        file: PathBuf,
+        /// Substrate to check against (any Kubernetes substrate, or docker-host)
+        #[arg(long, default_value = "docker-host")]
+        substrate: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum ConfigAction {
     /// Validate a config against the schema
     Validate {
@@ -170,20 +226,120 @@ fn main() -> Result<()> {
                 Ok(())
             }
         },
-        Command::Doctor => doctor(),
-        Command::Up(a) => up::run(&up_options(&cfg, None, a)),
-        Command::Down => up::down(&up::DownOptions {
+        Command::Doctor => doctor(&cfg),
+        Command::Environment { action } => {
+            let parsed = DabbaConfig::load(&cfg)?;
+            match action {
+                EnvironmentAction::Show => environment::show(&parsed.spec.environment),
+                EnvironmentAction::Check => environment::check(&parsed.spec.environment),
+                EnvironmentAction::Export => environment::export(&parsed.spec.environment),
+                EnvironmentAction::Verify { directory } => {
+                    let applications = environment::load_applications(&directory)?;
+                    let mut problems = environment::check_application_versions(
+                        &parsed.spec.environment,
+                        &applications,
+                    );
+                    // Hand-written compose stacks carry pinned images too; the
+                    // reconciler still accepts them, so a pin that only reached
+                    // rendered artifacts would miss the stack it was written for.
+                    let compose =
+                        environment::load_compose_files(Path::new("backends")).unwrap_or_default();
+                    problems.extend(environment::check_compose_versions(
+                        &parsed.spec.environment,
+                        &compose,
+                    ));
+
+                    if problems.is_empty() {
+                        println!(
+                            "✓ {} definition(s) and {} compose stack(s) agree with the \
+                             pinned service versions",
+                            applications.len(),
+                            compose.len()
+                        );
+                        return Ok(());
+                    }
+                    for problem in &problems {
+                        println!("  ≠ {problem}");
+                    }
+                    anyhow::bail!("{} disagreement(s) with the pin", problems.len())
+                }
+            }
+        }
+        Command::Application { action } => match action {
+            ApplicationAction::Validate { file } => {
+                let text = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let app = application::Application::parse(&text)?;
+                println!(
+                    "✓ {} is a valid portable application definition",
+                    app.metadata.name
+                );
+                Ok(())
+            }
+            ApplicationAction::Example => {
+                // The fixture the conformance matrix renders through both
+                // backends. Printing that exact value means the example users
+                // start from cannot drift from the one that is proven to work.
+                println!("{}", application::EXHAUSTIVE_EXAMPLE.trim_start());
+                Ok(())
+            }
+            ApplicationAction::Render { file, substrate } => {
+                let text = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let app = application::Application::parse(&text)?;
+                let rendered = if substrate == "docker-host" {
+                    render::compose::render(&app)?
+                } else {
+                    render::kubernetes::render(&app)?
+                };
+                print!("{rendered}");
+                Ok(())
+            }
+            ApplicationAction::Portability { file, substrate } => {
+                let text = std::fs::read_to_string(&file)
+                    .with_context(|| format!("reading {}", file.display()))?;
+                let app = application::Application::parse(&text)?;
+                let target_is_kubernetes = substrate != "docker-host";
+                let ignored = app.non_portable_fields(target_is_kubernetes);
+                if ignored.is_empty() {
+                    println!(
+                        "✓ {} is fully portable to {substrate} (no substrate-specific blocks)",
+                        app.metadata.name
+                    );
+                } else {
+                    println!(
+                        "! {} carries configuration {substrate} will ignore:",
+                        app.metadata.name
+                    );
+                    for field in &ignored {
+                        println!("    spec.{field}");
+                    }
+                    println!(
+                        "  These are escape hatches, so this is expected — but the \n  \
+                         behaviour they provide will not exist on {substrate}."
+                    );
+                }
+                Ok(())
+            }
+        },
+        Command::Up(a) => backend::select(&cfg, None)?.up(&up_options(&cfg, None, a)),
+        Command::Down => backend::select(&cfg, None)?.down(&backend::DownOptions {
             config: cfg,
             env: None,
         }),
-        Command::Status => up::status(&cfg, None),
-        Command::Kubeconfig { export } => up::kubeconfig(&cfg, None, export),
-        Command::Diagram { mermaid } => up::diagram(&cfg, None, mermaid),
-        Command::Secret { action } => match action {
-            SecretAction::Ls { path } => up::secret_ls(&cfg, None, path.as_deref()),
-            SecretAction::Get { name } => up::secret_get(&cfg, None, &name),
-        },
-        Command::Ls => up::ls(&cfg),
+        Command::Status => backend::select(&cfg, None)?.status(&cfg, None),
+        // `kubeconfig` is a Kubernetes concept, not a Backend verb — dispatch it
+        // straight to the k8s backend (a docker-host env reports "not deployed").
+        Command::Kubeconfig { export } => backend::kubernetes::kubeconfig(&cfg, None, export),
+        Command::Diagram { mermaid } => backend::select(&cfg, None)?.diagram(&cfg, None, mermaid),
+        Command::Secret { action } => {
+            let b = backend::select(&cfg, None)?;
+            match action {
+                SecretAction::Ls { path } => b.secret_ls(&cfg, None, path.as_deref()),
+                SecretAction::Get { name } => b.secret_get(&cfg, None, &name),
+            }
+        }
+        Command::Ls => backend::common::ls(&cfg),
         Command::Use { name } => edit::use_env(&cfg, &name),
         Command::Init => edit::init(&cfg),
         Command::Env { name, action } => dispatch_env(&cfg, &name, action),
@@ -199,15 +355,21 @@ fn main() -> Result<()> {
 fn dispatch_env(config: &Path, name: &str, action: Option<EnvAction>) -> Result<()> {
     let env = Some(name.to_string());
     match action {
-        None => up::show(config, name),
-        Some(EnvAction::Up(a)) => up::run(&up_options(config, env, a)),
-        Some(EnvAction::Down) => up::down(&up::DownOptions {
+        None => backend::common::show(config, name),
+        Some(EnvAction::Up(a)) => {
+            backend::select(config, Some(name))?.up(&up_options(config, env, a))
+        }
+        Some(EnvAction::Down) => backend::select(config, Some(name))?.down(&backend::DownOptions {
             config: config.to_path_buf(),
             env,
         }),
-        Some(EnvAction::Status) => up::status(config, Some(name)),
-        Some(EnvAction::Kubeconfig { export }) => up::kubeconfig(config, Some(name), export),
-        Some(EnvAction::Diagram { mermaid }) => up::diagram(config, Some(name), mermaid),
+        Some(EnvAction::Status) => backend::select(config, Some(name))?.status(config, Some(name)),
+        Some(EnvAction::Kubeconfig { export }) => {
+            backend::kubernetes::kubeconfig(config, Some(name), export)
+        }
+        Some(EnvAction::Diagram { mermaid }) => {
+            backend::select(config, Some(name))?.diagram(config, Some(name), mermaid)
+        }
         Some(EnvAction::Add { substrate, domain }) => {
             edit::add_env(config, name, &substrate, domain.as_deref())
         }
@@ -215,8 +377,8 @@ fn dispatch_env(config: &Path, name: &str, action: Option<EnvAction>) -> Result<
     }
 }
 
-fn up_options(config: &Path, env: Option<String>, a: UpArgs) -> up::Options {
-    up::Options {
+fn up_options(config: &Path, env: Option<String>, a: UpArgs) -> backend::Options {
+    backend::Options {
         config: config.to_path_buf(),
         env,
         quickstart_dir: a.quickstart_dir,
@@ -230,8 +392,26 @@ const MIN_TOFU: &str = "1.6.0";
 
 /// Check the day-0 prerequisites: tools present, the right versions, and (for
 /// docker) actually running.
-fn doctor() -> Result<()> {
+/// `dabba doctor` — check the tools the CONFIGURED substrates actually need.
+///
+/// This used to demand kubectl and tofu unconditionally, so it failed for anyone
+/// whose only environment was docker-host — on a substrate whose entire premise is
+/// not needing Kubernetes. A missing config is treated as "might be anything", so
+/// running `dabba doctor` before `dabba init` still checks everything.
+fn doctor(config: &Path) -> Result<()> {
     let mut problems: Vec<String> = Vec::new();
+
+    let substrates: Vec<config::Substrate> = config::DabbaConfig::load(config)
+        .map(|cfg| cfg.spec.environments.iter().map(|e| e.substrate).collect())
+        .unwrap_or_default();
+    let needs_kubernetes = substrates.is_empty()
+        || substrates
+            .iter()
+            .any(|s| !matches!(s, config::Substrate::DockerHost));
+    let needs_docker_host = substrates.is_empty()
+        || substrates
+            .iter()
+            .any(|s| matches!(s, config::Substrate::DockerHost));
 
     // docker: on PATH AND the daemon is reachable (a stopped daemon is the classic trap).
     if !on_path("docker") {
@@ -244,25 +424,41 @@ fn doctor() -> Result<()> {
         println!("  ✓ docker");
     }
 
-    // kubectl: presence is enough (it's tolerant of version skew).
-    if on_path("kubectl") {
-        println!("  ✓ kubectl");
-    } else {
-        println!("  ✗ kubectl (not found)");
-        problems.push("kubectl not on PATH".into());
+    // The reconciler on a compose host drives git and bash directly.
+    if needs_docker_host {
+        for tool in ["git", "bash"] {
+            if on_path(tool) {
+                println!("  ✓ {tool}");
+            } else {
+                println!("  ✗ {tool} (not found; needed by the docker-host substrate)");
+                problems.push(format!("{tool} not on PATH"));
+            }
+        }
     }
 
-    // tofu: on PATH AND >= MIN_TOFU (an older tofu fails confusingly mid-`up`).
-    match tofu_version() {
-        None => {
-            println!("  ✗ tofu (not found)");
-            problems.push("tofu not on PATH".into());
+    if needs_kubernetes {
+        // kubectl: presence is enough (it's tolerant of version skew).
+        if on_path("kubectl") {
+            println!("  ✓ kubectl");
+        } else {
+            println!("  ✗ kubectl (not found)");
+            problems.push("kubectl not on PATH".into());
         }
-        Some(v) if version_lt(&v, MIN_TOFU) => {
-            println!("  ✗ tofu {v} (need >= {MIN_TOFU})");
-            problems.push(format!("tofu {v} is older than {MIN_TOFU}"));
+
+        // tofu: on PATH AND >= MIN_TOFU (an older tofu fails confusingly mid-`up`).
+        match tofu_version() {
+            None => {
+                println!("  ✗ tofu (not found)");
+                problems.push("tofu not on PATH".into());
+            }
+            Some(v) if version_lt(&v, MIN_TOFU) => {
+                println!("  ✗ tofu {v} (need >= {MIN_TOFU})");
+                problems.push(format!("tofu {v} is older than {MIN_TOFU}"));
+            }
+            Some(v) => println!("  ✓ tofu ({v})"),
         }
-        Some(v) => println!("  ✓ tofu ({v})"),
+    } else {
+        println!("  · kubectl/tofu not checked (no Kubernetes substrate configured)");
     }
 
     if problems.is_empty() {
@@ -314,6 +510,57 @@ fn on_path(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every command the CLI offers has to appear in the docs.
+    ///
+    /// This branch added two top-level nouns, `application` and `environment`, and
+    /// listed neither — they were reachable only by running `--help` or by finding
+    /// the page that happened to mention them. Derived from the enum rather than a
+    /// hand-kept list, for the same reason every other list here is.
+    #[test]
+    fn every_command_is_listed_in_the_docs() {
+        let source = include_str!("main.rs");
+        let docs = include_str!("../docs/src/content/docs/index.mdx");
+
+        let body = source
+            .split_once("enum Command {")
+            .expect("the Command enum is declared in main.rs")
+            .1
+            .split_once("\n}\n")
+            .expect("the enum is closed")
+            .0;
+
+        let mut commands: Vec<String> = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            // A variant is `Name,` or `Name {`, at the top level of the enum.
+            let name = line.trim_end_matches(&[',', ' ', '{'][..]);
+            if name.is_empty()
+                || !name.starts_with(|c: char| c.is_ascii_uppercase())
+                || !name.chars().all(|c| c.is_ascii_alphanumeric())
+            {
+                continue;
+            }
+            // clap derives the command name by lowercasing the variant.
+            commands.push(name.to_lowercase());
+        }
+        commands.sort();
+        commands.dedup();
+
+        assert!(
+            commands.len() >= 10,
+            "parsed only {commands:?} out of the Command enum; the scan broke and this \
+             test would pass vacuously"
+        );
+
+        for command in &commands {
+            assert!(
+                docs.contains(&format!("`dabba {command}")),
+                "`dabba {command}` exists but is listed nowhere in the docs index, so \
+                 the only way to find it is --help"
+            );
+        }
+    }
 
     #[test]
     fn version_compare() {

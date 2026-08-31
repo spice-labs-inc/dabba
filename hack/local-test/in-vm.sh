@@ -4,9 +4,19 @@
 # the local dabba-gitops — the whole platform with no GitHub at all — then asserts
 # the demo app serves the OpenBao-seeded message and runs `dabba down`.
 #
-# SUBSTRATE (env, default kind) selects the local cluster: kind | k3d | minikube.
-# The configure layer and gitops are identical across substrates — only the
-# provisioning module changes. That is the kubeconfig seam, proven.
+# SUBSTRATE (env, default kind) selects what to run on:
+#   kind | k3d | minikube   a local Kubernetes cluster
+#   docker-host             no cluster at all — the bare-OS compose path
+#
+# For the Kubernetes substrates the configure layer and gitops are identical and
+# only the provisioning module changes; that is the kubeconfig seam, proven.
+#
+# docker-host does NOT share that seam and deliberately runs a different arc: it
+# has no kubeconfig, no Flux and no cluster to destroy. What it shares is the
+# CONTRACT — an application serving a value that came out of the secret store —
+# and the portable Application definition that both substrates render from. That
+# is the claim worth testing. Each run covers one substrate, so proving it takes
+# a docker-host run and a Kubernetes one; each asserts its own half below.
 set -euo pipefail
 H=/home/ubuntu
 SUBSTRATE="${SUBSTRATE:-kind}"
@@ -36,8 +46,21 @@ case "$SUBSTRATE" in
   minikube)
     command -v minikube >/dev/null || {
       sudo curl -fsSLo /usr/local/bin/minikube https://storage.googleapis.com/minikube/releases/latest/minikube-linux-amd64; sudo chmod +x /usr/local/bin/minikube; } ;;
+  docker-host)
+    # No cluster tooling at all. This is the point of the substrate.
+    : ;;
   *) echo "unknown substrate: $SUBSTRATE"; exit 1 ;;
 esac
+
+# The compose path shares none of the tofu/Flux flow below, so it runs its own
+# end-to-end script and stops here rather than threading a second set of
+# conditionals through every step of the Kubernetes arc.
+if [ "$SUBSTRATE" = "docker-host" ]; then
+  step "Building the dabba CLI"
+  cargo build --release --manifest-path "$H/dabba/Cargo.toml"
+  step "docker-host end to end"
+  exec bash "$H/dabba/backends/docker/test/run-end-to-end-test.sh"
+fi
 
 step "Building the dabba CLI"
 cargo build --release --manifest-path "$H/dabba/Cargo.toml"
@@ -114,6 +137,54 @@ if ! echo "$body" | grep -q "delivered through dabba"; then
   echo; echo "########## [$SUBSTRATE] FAIL (up) ##########"; exit 1
 fi
 echo "  up OK"
+
+step "The same portable Application definition also runs on Kubernetes"
+# The docker-host end-to-end proves this definition serves an OpenBao-backed
+# value on a compose host. Rendering it here and asserting the same thing is what
+# turns "portable" from a property of the renderer into a property of the system.
+cat > "$H/portable.yaml" <<'PORTABLE'
+apiVersion: dabba.spicelabs.io/v1alpha1
+kind: Application
+metadata:
+  name: portableecho
+spec:
+  image: hashicorp/http-echo
+  tag: "1.0"
+  ports:
+    - name: http
+      containerPort: 5678
+      publish: 5678
+  environment:
+    - name: ECHO_TEXT
+      value: "delivered through dabba"
+  dockerHost:
+    command: ["-listen=:5678", "-text=$ECHO_TEXT"]
+  kubernetes:
+    spec:
+      template:
+        spec:
+          containers:
+            - name: portableecho
+              image: hashicorp/http-echo:1.0
+              args: ["-listen=:5678", "-text=delivered through dabba"]
+              ports:
+                - name: http
+                  containerPort: 5678
+PORTABLE
+"$DABBA" application validate "$H/portable.yaml"
+"$DABBA" application render "$H/portable.yaml" --substrate "$SUBSTRATE" > "$H/portable-k8s.yaml"
+kubectl apply -f "$H/portable-k8s.yaml"
+kubectl wait --for=condition=available --timeout=180s deployment/portableecho || true
+kubectl port-forward svc/portableecho 5678:5678 > /dev/null 2>&1 &
+pf2=$!; sleep 5
+portable_body=$(curl -sf http://localhost:5678/ || true)
+kill $pf2 2>/dev/null || true
+echo "  portable app response: ${portable_body:-<empty>}"
+if ! echo "$portable_body" | grep -q "delivered through dabba"; then
+  echo; echo "########## [$SUBSTRATE] FAIL (portable definition did not serve) ##########"; exit 1
+fi
+echo "  the same definition serves the same value on $SUBSTRATE and on docker-host"
+kubectl delete -f "$H/portable-k8s.yaml" --ignore-not-found > /dev/null 2>&1
 
 step "dabba status + diagram (smoke)"
 "$DABBA" status -c "$H/dabba.yaml" || true

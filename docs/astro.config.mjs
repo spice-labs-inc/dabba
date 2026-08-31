@@ -45,6 +45,7 @@ export default defineConfig({
             { label: "Architecture", link: "/architecture/" },
             { label: "Configuration", link: "/configuration/" },
             { label: "Observability", link: "/observability/" },
+            { label: "Pinned environment", link: "/pinned-environment/" },
           ],
         },
       ],
