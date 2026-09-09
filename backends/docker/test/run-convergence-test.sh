@@ -152,6 +152,14 @@ YAML
     else
         fail "long-form bind mount source ./data was NOT pre-created (the awk regression)"
     fi
+    # The render must be namespaced as the project the stack is brought up as,
+    # or `compose config` names the network after the base file's directory and
+    # an x-health-cmd rendered against gitops-<app> can never reach the stack.
+    if grep -q "name: gitops-${APP}_default" "$S/$APP/docker-compose.yml" 2>/dev/null; then
+        pass "rendered network matches the project the stack runs as"
+    else
+        fail "rendered network is not gitops-${APP}_default; health gates could not reach the stack"
+    fi
 fi
 
 ###############################################################################

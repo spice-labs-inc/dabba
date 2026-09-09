@@ -19,7 +19,9 @@ Every minute the loop runs `reconcile.sh`, which:
 2. For each app declared under **this box** at
    `<GITOPS_APPS_DIR>/<box>/<app>/`, resolves desired state (a full
    `docker-compose.yml`, or a shared `base/<app>` + this box's
-   `docker-compose.override.yml` merged with `docker compose config`).
+   `docker-compose.override.yml` merged with `docker compose config -p
+   gitops-<app>`, so the merge renders against the same project the stack is
+   brought up as).
 3. Compares the **rendered** desired file to what was last applied in
    `<STACKS_DIR>/<app>/`; if unchanged, does nothing.
 4. On a change: pre-creates `./`-relative bind-mount sources (so dockerd does not

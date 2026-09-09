@@ -302,7 +302,12 @@ render_desired() {
         # override used to fail with no indication of what was wrong with it.
         local errors
         errors="$(mktemp "${TMPDIR:-/tmp}/dabba-render-error.XXXXXX")"
-        if docker compose -f "$base" -f "$override" config \
+        # -p is not cosmetic: `compose config` bakes the project name into the
+        # rendered output (`networks.default.name: <project>_default`), and the
+        # stack is brought up as project "gitops-<app>" below. Rendering without
+        # it derives the project from the base file's directory, so the rendered
+        # network never matches the one the stack actually gets.
+        if docker compose -p "gitops-$app" -f "$base" -f "$override" config \
                --no-interpolate --no-path-resolution > "$out" 2> "$errors"; then
             rm -f "$errors"
             return 0
